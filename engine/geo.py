@@ -150,7 +150,7 @@ def build_nodes(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             if lat is not None and lon is not None:
                 rows.append({"name": w, "type": "warehouse", "location": loc_s, "lat": lat, "lon": lon})
 
-    # Customers
+    # Customers from Customers sheet (preferred)
     custs = dfs.get("Customers")
     if isinstance(custs, pd.DataFrame) and not custs.empty:
         for _, r in custs.iterrows():
@@ -163,6 +163,22 @@ def build_nodes(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             lat, lon = resolve_latlon(loc_s, ext)
             if lat is not None and lon is not None:
                 rows.append({"name": c_s, "type": "customer", "location": loc_s, "lat": lat, "lon": lon})
+
+    # Fallback: derive customers from CPD if Customers sheet missing/empty
+    if not isinstance(custs, pd.DataFrame) or custs.empty:
+        cpd = dfs.get("Customer Product Data")
+        if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+            # Prefer CPD.Location if present, else Customer name
+            for _, r in cpd.iterrows():
+                cust_name = r.get("Customer")
+                if pd.isna(cust_name):
+                    continue
+                cust_name = str(cust_name)
+                loc = r.get("Location")
+                loc_s = str(loc) if pd.notna(loc) else cust_name
+                lat, lon = resolve_latlon(loc_s, ext)
+                if lat is not None and lon is not None:
+                    rows.append({"name": cust_name, "type": "customer", "location": loc_s, "lat": lat, "lon": lon})
 
     # Deduplicate (keep first)
     if rows:
