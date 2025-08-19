@@ -50,13 +50,9 @@ try:
             st.warning("Scenario processing and optimization will be added in the next step.")
 
     else:
-        with open("sample_base_case.xlsx", "rb") as f:
-        st.download_button(
-            "⬇️ Download Sample Base Case Template",
-            f,
-            file_name="sample_base_case.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.markdown("""
+        👉 Or [Download Sample Base Case Template](https://example.com/sample_base_case.xlsx) to try it out.
+        """)
 
 except ModuleNotFoundError as e:
     print("This application requires Streamlit to run. Please install it using `pip install streamlit`.")
