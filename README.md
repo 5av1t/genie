@@ -45,21 +45,5 @@ Open the URL Streamlit prints (usually [http://localhost:8501](http://localhost:
 
 ---
 
-## 🧩 Roadmap
 
-* [ ] NL → Scenario JSON parser (`prompts/parser.py`)
-* [ ] Sheet Update Engine (`engine/updater.py`)
-* [ ] Quick MILP optimizer with PuLP (`engine/optimizer.py`)
-* [ ] Exec summary generator (`engine/reporter.py`)
-* [ ] Download updated Excel scenario
-
----
-
-## 🌐 Hosting (Streamlit Cloud)
-
-1. Push this repo to GitHub.
-2. Go to [https://streamlit.io/cloud](https://streamlit.io/cloud) → **New app** → pick this repo/branch → **Deploy**.
-3. Share the public URL with your team.
-
-> If deployment fails with `ModuleNotFoundError: No module named 'streamlit'`, ensure **requirements.txt** is present in the repo root.
 
