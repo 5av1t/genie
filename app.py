@@ -5,7 +5,9 @@ import os
 import sys
 from io import BytesIO
 import pandas as pd
+import openai
 
+openai.api_key = st.secrets["openai"]["api_key"]
 # Streamlit import (fail clearly if missing)
 try:
     import streamlit as st
