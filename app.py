@@ -1,8 +1,9 @@
-# --- GENIE: Streamlit App (MVP with Parsing + Prompt Examples) ---
+# --- GENIE: Streamlit App (MVP with Parsing + Applying Demand Updates + Prompt Examples) ---
 
 import os
 import sys
 import pandas as pd
+from io import BytesIO
 
 # Streamlit import (fail clearly if missing)
 try:
@@ -47,13 +48,22 @@ except Exception:
         )
         st.stop()
 
-# --------- Parser import ----------
+# --------- Parser & Updater imports ----------
 try:
     from engine.parser import parse_prompt
 except ModuleNotFoundError:
     st.error(
         "❌ Missing `engine/parser.py`.\n"
         "Create `engine/parser.py` with a `parse_prompt(prompt, dfs, default_period=2023)` function."
+    )
+    st.stop()
+
+try:
+    from engine.updater import apply_scenario
+except ModuleNotFoundError:
+    st.error(
+        "❌ Missing `engine/updater.py`.\n"
+        "Create `engine/updater.py` with an `apply_scenario(dfs, scenario)` function."
     )
     st.stop()
 
@@ -71,8 +81,11 @@ with st.expander("🔧 Environment health"):
 st.title("🔮 GENIE - Generative Engine for Network Intelligence & Execution")
 st.markdown(
     """
-Upload your base case Excel, type a what‑if scenario, and GENIE will parse it into **Scenario JSON**.
-*(Applying updates & optimization comes next.)*
+Upload your base case Excel, type a what‑if scenario, and GENIE will:
+1) parse it into **Scenario JSON**, and
+2) **apply the demand updates** to your workbook.
+
+*(Optimization and maps will be added next.)*
 """
 )
 
@@ -100,7 +113,7 @@ with st.expander("📘 How to use"):
         """
 1. **Upload** your base case Excel (.xlsx)
 2. **Type** a prompt, or pick an example above and click **Insert example**
-3. Click **🚀 Process Scenario** to see the parsed JSON
+3. Click **🚀 Process Scenario** to see the parsed JSON and updated data
 """
     )
 
@@ -129,6 +142,7 @@ if uploaded_file:
     process = st.button("🚀 Process Scenario")
 
     if process and (st.session_state.get("user_prompt") or "").strip():
+        # 1) Parse NL → Scenario JSON
         try:
             scenario = parse_prompt(st.session_state["user_prompt"], dataframes, default_period=2023)
         except Exception as e:
@@ -137,6 +151,38 @@ if uploaded_file:
 
         st.subheader("Parsed Scenario JSON")
         st.json(scenario)
+
+        # 2) Apply scenario (demand updates)
+        try:
+            updated = apply_scenario(dataframes, scenario)
+        except Exception as e:
+            st.error(f"❌ Applying scenario failed: {e}")
+            st.stop()
+
+        st.subheader("Preview: Customer Product Data (top 25 rows)")
+        cpd = updated.get("Customer Product Data")
+        if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+            st.dataframe(cpd.head(25))
+        else:
+            st.info("No 'Customer Product Data' available after applying the scenario.")
+
+        # 3) Download updated Excel
+        try:
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                for name, df in updated.items():
+                    if isinstance(df, pd.DataFrame):
+                        # Truncate sheet name to Excel limits and avoid duplicates if any
+                        sheet_name = str(name)[:31] if name else "Sheet"
+                        df.to_excel(w, sheet_name=sheet_name, index=False)
+            st.download_button(
+                label="💾 Download Updated Scenario Excel",
+                data=buf.getvalue(),
+                file_name="genie_updated_scenario.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.warning(f"Creating the Excel download failed: {e}")
 else:
     # Sample download (prefer bundling the file; fallback to raw GitHub URL)
     raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
