@@ -126,14 +126,28 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         if not npd.empty:
             warn.append(f"Customer Product Data: {len(npd)} row(s) with non-positive Demand.")
 
+    
     # Orphan lanes
     tc = dfs.get("Transport Cost")
     if isinstance(tc, pd.DataFrame) and not tc.empty:
+        wh = dfs.get("Warehouse")
         wh_locs = set()
-        if isinstance(wh, pd.DataFrame) and not wh.empty:
+        if isinstance(wh, pd.DataFrame) and not wh.empty and "Location" in wh.columns:
             wh_locs = set(str(x) for x in wh["Location"].dropna().unique())
+
+        # Build valid customer targets from Customers OR CPD
+        cust_names = set()
         custs = dfs.get("Customers")
-        cust_names = set(str(x) for x in custs["Customer"].dropna().unique()) if isinstance(custs, pd.DataFrame) else set()
+        if isinstance(custs, pd.DataFrame) and not custs.empty and "Customer" in custs.columns:
+            cust_names |= set(str(x) for x in custs["Customer"].dropna().unique())
+
+        cpd = dfs.get("Customer Product Data")
+        if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+            if "Customer" in cpd.columns:
+                cust_names |= set(str(x) for x in cpd["Customer"].dropna().unique())
+            # Some models use CPD.Location as the “to” token; include it as valid too
+            if "Location" in cpd.columns:
+                cust_names |= set(str(x) for x in cpd["Location"].dropna().unique())
 
         orphan_from = 0
         orphan_to = 0
@@ -145,10 +159,12 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             if cust_names and tl not in cust_names:
                 orphan_to += 1
         if orphan_from or orphan_to:
-            warn.append(f"Transport Cost: orphan lanes — From not in Warehouse.Location: {orphan_from}, To not in Customers.Customer: {orphan_to}")
+            warn.append(
+                f"Transport Cost: orphan lanes — "
+                f"From not in Warehouse.Location: {orphan_from}, "
+                f"To not in Customers/CPD: {orphan_to}"
+            )
 
-    report["_warnings"] = warn
-    return report
 
 
 def load_excel(file_like) -> Dict[str, pd.DataFrame]:
