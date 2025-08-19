@@ -1,5 +1,6 @@
-# --- GENIE: Streamlit App (MVP with Parsing) ---
+# --- GENIE: Streamlit App (MVP with Parsing + Prompt Examples) ---
 
+import os
 import sys
 import pandas as pd
 
@@ -23,35 +24,48 @@ try:
 except Exception:
     try:
         from engine.loader import load_excel as _load_excel
+
         def loader(file):
             dfs = _load_excel(file)
             # fabricate a simple validation report if your loader doesn't validate
-            report = {name: {"missing_columns": [], "num_rows": df.shape[0], "num_columns": df.shape[1]}
-                      for name, df in dfs.items()}
+            report = {
+                name: {
+                    "missing_columns": [],
+                    "num_rows": df.shape[0],
+                    "num_columns": df.shape[1],
+                }
+                for name, df in dfs.items()
+            }
             return dfs, report
     except Exception as e:
-        st.error("❌ Could not import a loader from engine/loader.py.\n"
-                 "Make sure one of these exists:\n"
-                 "  - load_and_validate_excel(file)\n"
-                 "  - load_excel(file)\n"
-                 f"\nImport error: {e}")
+        st.error(
+            "❌ Could not import a loader from engine/loader.py.\n"
+            "Make sure one of these exists:\n"
+            "  - load_and_validate_excel(file)\n"
+            "  - load_excel(file)\n"
+            f"\nImport error: {e}"
+        )
         st.stop()
 
 # --------- Parser import ----------
 try:
     from engine.parser import parse_prompt
-except ModuleNotFoundError as e:
-    st.error("❌ Missing `engine/parser.py`.\n"
-             "Create `engine/parser.py` with a `parse_prompt(prompt, dfs, default_period=2023)` function.")
+except ModuleNotFoundError:
+    st.error(
+        "❌ Missing `engine/parser.py`.\n"
+        "Create `engine/parser.py` with a `parse_prompt(prompt, dfs, default_period=2023)` function."
+    )
     st.stop()
 
 # --------- Optional env health ----------
 with st.expander("🔧 Environment health"):
-    st.write({
-        "python_version": sys.version.split()[0],
-        "streamlit_version": st.__version__,
-        "pandas_version": pd.__version__,
-    })
+    st.write(
+        {
+            "python_version": sys.version.split()[0],
+            "streamlit_version": st.__version__,
+            "pandas_version": pd.__version__,
+        }
+    )
 
 # --------- UI ---------
 st.title("🔮 GENIE - Generative Engine for Network Intelligence & Execution")
@@ -62,18 +76,37 @@ Upload your base case Excel, type a what‑if scenario, and GENIE will parse it 
 """
 )
 
+# 💡 Prompt examples (copyable + insertable)
+EXAMPLES = [
+    "Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8",
+    "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
+    "Enable Thin-Film at Antalya_FG",
+    "Set Secondary Delivery LTL lane Paris_CDC → Aalborg for Poly-Crystalline to cost per uom = 9.5",
+]
+
+with st.expander("💡 Prompt examples"):
+    for ex in EXAMPLES:
+        st.code(ex, language="text")
+    st.divider()
+    # Small helper: insert one into the text area
+    selected = st.selectbox("Insert an example into the prompt box:", ["(choose one)"] + EXAMPLES)
+    if st.button("Insert example"):
+        if selected != "(choose one)":
+            st.session_state["user_prompt"] = selected
+            st.success("Inserted example into the prompt box below.")
+
 with st.expander("📘 How to use"):
     st.markdown(
         """
 1. **Upload** your base case Excel (.xlsx)
-2. **Type** a prompt, e.g.  
-   `Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8`
+2. **Type** a prompt, or pick an example above and click **Insert example**
 3. Click **🚀 Process Scenario** to see the parsed JSON
 """
     )
 
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
-user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120)
+# use a key so we can programmatically set it
+user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt")
 
 if uploaded_file:
     # ---- Load & validate ----
@@ -95,9 +128,9 @@ if uploaded_file:
     # ---- Process button (define it BEFORE using it) ----
     process = st.button("🚀 Process Scenario")
 
-    if process and user_prompt.strip():
+    if process and (st.session_state.get("user_prompt") or "").strip():
         try:
-            scenario = parse_prompt(user_prompt, dataframes, default_period=2023)
+            scenario = parse_prompt(st.session_state["user_prompt"], dataframes, default_period=2023)
         except Exception as e:
             st.error(f"❌ Parsing failed: {e}")
             st.stop()
@@ -105,22 +138,18 @@ if uploaded_file:
         st.subheader("Parsed Scenario JSON")
         st.json(scenario)
 else:
-    # Optional sample download
-    import io, requests, streamlit as st
+    # Sample download (prefer bundling the file; fallback to raw GitHub URL)
+    raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
 
-raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
-try:
-    r = requests.get(raw_url, timeout=10)
-    r.raise_for_status()
-    buf = io.BytesIO(r.content)
-    st.download_button(
-        "⬇️ Download Sample Base Case Template",
-        buf.getvalue(),
-        file_name="sample_base_case.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-except Exception as e:
-    st.warning(f"Template download failed from GitHub raw: {e}")
-    st.markdown(f"Try opening it directly: [{raw_url}]({raw_url})")
-    except FileNotFoundError:
-        st.info("Add a `sample_base_case.xlsx` to the repo root to enable a sample download.")
+    if os.path.exists("sample_base_case.xlsx"):
+        with open("sample_base_case.xlsx", "rb") as f:
+            st.download_button(
+                label="⬇️ Download Sample Base Case Template",
+                data=f,
+                file_name="sample_base_case.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    else:
+        # Fallback: direct link to raw GitHub (do not proxy through custom domains)
+        st.markdown(f"[⬇️ Download Sample Base Case Template]({raw_url})")
+        st.info("Tip: add `sample_base_case.xlsx` to the repo root to enable the in‑app download button.")
