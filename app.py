@@ -8,6 +8,7 @@ except ModuleNotFoundError:
     raise
 
 import sys
+from engine.parser import parse_prompt
 import pandas as pd
 
 # Internal modules
@@ -100,13 +101,10 @@ if uploaded_file:
 
     # 🚀 Process button (NOW ACTIVE)
     process = st.button("🚀 Process Scenario")
-    if process and user_prompt.strip():
-        # 1) Parse NL → Scenario JSON
-        scenario = parse_prompt(user_prompt, dataframes, default_period=2023)
-
-        st.subheader("Parsed Scenario JSON")
-        st.json(scenario)
-
+if process and user_prompt.strip():
+    scenario = parse_prompt(user_prompt, dataframes, default_period=2023)
+    st.subheader("Parsed Scenario JSON")
+    st.json(scenario)
         # (Step 2 will apply these changes to DataFrames; Step 3 will optimize)
 else:
     # Provide a real download if the sample file exists in the repo
