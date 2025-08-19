@@ -1,19 +1,19 @@
-# --- GENIE: Streamlit App (Full + GenAI vs Rules, Auto-Connect, Early Map, Base Model Run) ---
-# Parse → Apply → (Auto-Connect Lanes) → Optimize → KPIs & Summary → Map → Delta Views → Download
+# --- GENIE: Streamlit App (Gemini + OpenAI + Rules, Dynamic Examples, Auto-Connect, Maps, Optimizer) ---
 
 import os
-import sys
 from io import BytesIO
+import json
+import hashlib
 import pandas as pd
 
-# Streamlit import (fail clearly if missing)
+# Streamlit import
 try:
     import streamlit as st
 except ModuleNotFoundError:
     print("This app requires Streamlit. Add `streamlit` to requirements.txt and redeploy.")
     raise
 
-# Optional mapping lib (pydeck ships with Streamlit, but guard anyway)
+# Optional mapping lib
 try:
     import pydeck as pdk
 except Exception:
@@ -21,43 +21,32 @@ except Exception:
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# Inject OPENAI_API_KEY from Streamlit secrets (for GitHub→Streamlit Cloud)
+# ========= Secrets → env (OpenAI + Gemini) =========
+# Streamlit Cloud: set in Settings → Secrets:
+# [openai]
+# api_key = "sk-..."
+# [gemini]
+# api_key = "YOUR_GEMINI_API_KEY"
 if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
+if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
+    os.environ["GEMINI_API_KEY"] = st.secrets["gemini"]["api_key"]
 
-# ========= Loader import (two styles supported) =========
-loader = None
-try:
-    # Preferred: validator-enabled loader
-    from engine.loader import load_and_validate_excel as loader
-except Exception:
-    try:
-        from engine.loader import load_excel as _load_excel
-
-        def loader(file):
-            dfs = _load_excel(file)
-            # fabricate a simple validation report if your loader doesn't validate
-            report = {
-                name: {
-                    "missing_columns": [],
-                    "num_rows": df.shape[0],
-                    "num_columns": df.shape[1],
-                }
-                for name, df in dfs.items()
-            }
-            return dfs, report
-    except Exception as e:
-        st.error(
-            "❌ Could not import a loader from engine/loader.py.\n"
-            "Make sure one of these exists:\n"
-            "  - load_and_validate_excel(file)\n"
-            "  - load_excel(file)\n"
-            f"\nImport error: {e}"
-        )
-        st.stop()
-
-# ========= Engine imports =========
+# ========= Imports from engine =========
 missing_engine = []
+
+# Loader
+try:
+    from engine.loader import load_and_validate_excel as loader
+except Exception as e:
+    st.error(
+        "❌ Could not import a loader from engine/loader.py.\n"
+        "Ensure `load_and_validate_excel(file)` exists.\n\n"
+        f"Import error: {e}"
+    )
+    st.stop()
+
+# Parsers and engine
 try:
     from engine.parser import parse_prompt as parse_rules
 except ModuleNotFoundError:
@@ -68,94 +57,84 @@ try:
     from engine.updater import apply_scenario
 except ModuleNotFoundError:
     missing_engine.append("engine/updater.py (apply_scenario)")
+
 try:
     from engine.optimizer import run_optimizer
 except ModuleNotFoundError:
     missing_engine.append("engine/optimizer.py (run_optimizer)")
+
 try:
     from engine.reporter import build_summary
 except ModuleNotFoundError:
     missing_engine.append("engine/reporter.py (build_summary)")
+
 try:
     from engine.geo import build_nodes, flows_to_geo, guess_map_center
 except ModuleNotFoundError:
     missing_engine.append("engine/geo.py (build_nodes, flows_to_geo)")
 
-# GenAI (optional)
+# GenAI (OpenAI/Gemini) + Example generator
 try:
     from engine.genai import parse_with_llm, summarize_scenario
 except ModuleNotFoundError:
     parse_with_llm = None
     summarize_scenario = None
 
+try:
+    from engine.example_gen import examples_for_file
+except ModuleNotFoundError:
+    examples_for_file = None
+
 if missing_engine:
     st.error("❌ Missing engine modules:\n- " + "\n- ".join(missing_engine))
     st.stop()
 
-# ========= Header & help =========
-st.title("🔮 GENIE - Generative Engine for Network Intelligence & Execution")
-st.markdown(
-    """
-Upload your base case Excel, type a what‑if scenario, and GENIE will:
-1) parse it into **Scenario JSON** (LLM or rules),  
-2) **apply network updates** to your data,  
-3) (optional) **auto‑connect missing lanes** for feasibility,  
-4) run a **quick optimization**,  
-5) show **KPIs + executive summary**,  
-6) draw an **interactive network map** (warehouses, customers, flows), and  
-7) provide **Delta Views** and an **updated Excel** to download.
-"""
-)
+# ========= Header =========
+st.title("🔮 GENIE — Generative Engine for Network Intelligence & Execution")
+st.caption("Upload a base-case workbook → describe changes → GENIE updates sheets, optimizes, and maps your network.")
 
-EXAMPLES = [
+# ========= Sidebar: Provider & Options =========
+with st.sidebar:
+    st.header("⚙️ Settings")
+    provider = st.selectbox(
+        "Model Provider",
+        ["Google Gemini (free tier)", "OpenAI", "Rules only (no LLM)"],
+        index=0,
+        help="Use Gemini for free starter usage. You can switch to OpenAI if you have billing enabled. Rules-only disables GenAI parsing & example generation.",
+    )
+    use_llm_parser = st.checkbox(
+        "Use GenAI parser for scenarios",
+        value=(provider != "Rules only (no LLM)"),
+        help="If off, the rules parser is used for NL → Scenario JSON."
+    )
+    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False)
+
+# ========= Static examples (pre-upload fallback) =========
+STATIC_EXAMPLES = [
     "run the base model",
     "Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8",
     "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
     "Enable Thin-Film at Antalya_FG",
-    "Set Secondary Delivery LTL lane Paris_CDC → Aalborg for Poly-Crystalline to cost per uom = 9.5",
+    "Set Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline to cost per uom = 9.5",
 ]
 
-with st.expander("💡 Prompt examples"):
-    for ex in EXAMPLES:
+with st.expander("💡 Prompt examples (static fallback)"):
+    for ex in STATIC_EXAMPLES:
         st.code(ex, language="text")
-    st.divider()
-    selected = st.selectbox("Insert an example into the prompt box:", ["(choose one)"] + EXAMPLES, key="example_select")
-    if st.button("Insert example"):
-        if selected != "(choose one)":
-            st.session_state["user_prompt"] = selected
-            st.success("Inserted example into the prompt box below.")
-
-with st.expander("📘 How to use"):
-    st.markdown(
-        """
-1. **Upload** your base case Excel (.xlsx)  
-2. **Type** a prompt, or pick an example above and click **Insert example**  
-3. Click **🚀 Process Scenario** to see parsed scenario (bullets), applied edits, KPIs, map, deltas, and download  
-4. Use **Auto‑connect** to generate placeholder lanes for demo feasibility  
-5. Use **Parse with LLM & Rules (side‑by‑side)** to compare parsers
-"""
-    )
+    chosen = st.selectbox("Insert example:", ["(choose one)"] + STATIC_EXAMPLES, key="static_select")
+    if st.button("Insert (static)"):
+        if chosen != "(choose one)":
+            st.session_state["user_prompt"] = chosen
+            st.success("Inserted into the prompt box.")
 
 # ========= Inputs =========
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
 user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt")
-
-use_llm = st.checkbox(
-    "🤖 Use GenAI parser (schema‑validated)",
-    value=True,
-    help="Use the LLM to parse your prompt into scenario JSON. Falls back to rules parser if unavailable."
-)
-side_by_side = st.checkbox(
-    "🧪 Parse with LLM & Rules (side‑by‑side)",
-    value=False,
-    help="Debug mode: parse the prompt with both parsers and compare outputs before applying."
-)
-
 process = st.button("🚀 Process Scenario")
 
 # ========= Helpers: Delta Views & Auto-connect =========
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, key_cols: list) -> pd.DataFrame:
-    if after is None or after.empty:
+    if after is None or not isinstance(after, pd.DataFrame) or after.empty:
         return pd.DataFrame(columns=key_cols + ["Field", "Before", "After", "ChangeType"])
     before = before.copy() if isinstance(before, pd.DataFrame) else pd.DataFrame(columns=key_cols)
     after = after.copy()
@@ -196,9 +175,9 @@ def show_delta_block(title: str, before: pd.DataFrame, after: pd.DataFrame, key_
     delta_df = build_delta_view(before, after, key_cols)
     if not delta_df.empty:
         st.dataframe(delta_df, use_container_width=True)
-        added_rows = delta_df.loc[delta_df["ChangeType"] == "New", key_cols].drop_duplicates().shape[0] if "ChangeType" in delta_df.columns else 0
-        updated_rows = delta_df.loc[delta_df["ChangeType"] == "Updated", key_cols].drop_duplicates().shape[0] if "ChangeType" in delta_df.columns else 0
-        st.success(f"Applied changes: {updated_rows} updated row(s), {added_rows} new row(s).")
+        added = delta_df.loc[delta_df["ChangeType"] == "New", key_cols].drop_duplicates().shape[0] if "ChangeType" in delta_df.columns else 0
+        updated = delta_df.loc[delta_df["ChangeType"] == "Updated", key_cols].drop_duplicates().shape[0] if "ChangeType" in delta_df.columns else 0
+        st.success(f"Applied changes: {updated} updated row(s), {added} new row(s).")
     else:
         st.info(f"No visible changes detected in {title}.")
 
@@ -230,7 +209,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
             dem = float(r.get("Demand", 0) or 0)
             if dem > 0:
                 need.add((cust, prod))
-    # existing arcs (for period)
+    # existing arcs
     existing = set()
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         for _, r in tc.iterrows():
@@ -275,25 +254,60 @@ if uploaded_file:
         st.stop()
 
     with st.expander("✅ Sheet Validation Report"):
-    # Show per-sheet status; skip non-dict entries like "_warnings"
+        # Per-sheet status; skip non-dict entries like "_warnings"
         for sheet, rep in validation_report.items():
             if not isinstance(rep, dict):
                 continue
-                missing = rep.get("missing_columns", [])
+            missing = rep.get("missing_columns", [])
             if missing:
                 st.error(f"{sheet}: Missing columns - {missing}")
             else:
                 st.success(f"{sheet}: OK ({rep.get('num_rows', 0)} rows, {rep.get('num_columns', 0)} columns)")
-
-    # Show global warnings (if any)
         warns = validation_report.get("_warnings", [])
         if isinstance(warns, list) and warns:
             st.warning("General warnings:")
             for w in warns:
                 st.write(f"• {w}")
 
-
     st.success("Base case loaded successfully.")
+
+    # ---- Dynamic GenAI examples (Gemini/OpenAI) ----
+    st.subheader("💡 Prompt examples (from your file)")
+    # Cache by a simple fingerprint of sheet names + sizes
+    try:
+        fp_hasher = hashlib.sha1()
+        fp_hasher.update("|".join(sorted([f"{k}:{v.shape[0]}x{v.shape[1]}" for k, v in dataframes.items() if isinstance(v, pd.DataFrame)])).encode())
+        fingerprint = fp_hasher.hexdigest()
+    except Exception:
+        fingerprint = "nofp"
+
+    if "examples_cache" not in st.session_state:
+        st.session_state["examples_cache"] = {}
+
+    dyn_examples = None
+    if fingerprint in st.session_state["examples_cache"]:
+        dyn_examples = st.session_state["examples_cache"][fingerprint]
+    else:
+        try:
+            if examples_for_file is not None:
+                prov = "gemini" if provider.startswith("Google") else ("openai" if provider == "OpenAI" else "none")
+                dyn_examples = examples_for_file(dataframes, provider=prov)
+            else:
+                dyn_examples = []
+        except Exception:
+            dyn_examples = []
+        st.session_state["examples_cache"][fingerprint] = dyn_examples or []
+
+    if dyn_examples:
+        for ex in dyn_examples:
+            st.code(ex, language="text")
+        chosen2 = st.selectbox("Insert example:", ["(choose one)"] + dyn_examples, key="dyn_select")
+        if st.button("Insert (from file)"):
+            if chosen2 != "(choose one)":
+                st.session_state["user_prompt"] = chosen2
+                st.success("Inserted into the prompt box.")
+    else:
+        st.info("Could not generate dynamic examples (using static examples above).")
 
     # ---- Early map (nodes only) ----
     st.subheader("🌍 Network Map (Nodes)")
@@ -301,7 +315,7 @@ if uploaded_file:
         try:
             nodes_df = build_nodes(dataframes)
             if nodes_df.empty:
-                st.info("No geocoded nodes available yet. Add a 'Locations' sheet with Latitude/Longitude or use recognized city names.")
+                st.info("No geocoded nodes yet. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
             else:
                 lat0, lon0 = guess_map_center(nodes_df)
                 wh_nodes = nodes_df[nodes_df["type"] == "warehouse"]
@@ -338,24 +352,17 @@ if uploaded_file:
     else:
         st.info("pydeck not available in this environment, skipping map.")
 
-    # ---- Controls ----
-    colP1, colP2 = st.columns([1,1], vertical_alignment="center")
-    with colP1:
-        st.caption("Process with the selected parser below")
-        go_clicked = process
-    with colP2:
-        both_clicked = st.button("🧪 Parse with LLM & Rules (side‑by‑side)")
-
-    # ---- Side-by-side parser comparison (optional) ----
-    if both_clicked and (st.session_state.get("user_prompt") or "").strip():
+    # ---- LLM vs Rules (optional debug) ----
+    if show_llm_vs_rules and (st.session_state.get("user_prompt") or "").strip():
         tabs = st.tabs(["LLM Parser", "Rules Parser", "Diff"])
         llm_scenario = None
         rules_scenario = None
         with tabs[0]:
-            if parse_with_llm is None:
-                st.error("GenAI parser not available (engine/genai.py missing or OPENAI_API_KEY not set).")
+            if parse_with_llm is None or provider == "Rules only (no LLM)":
+                st.error("GenAI parser disabled or not available.")
             else:
-                llm_scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023)
+                prov = "gemini" if provider.startswith("Google") else "openai"
+                llm_scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
                 if summarize_scenario:
                     bullets = summarize_scenario(llm_scenario)
                     st.markdown("**Summary**")
@@ -374,9 +381,9 @@ if uploaded_file:
                 with st.expander("Advanced: raw JSON"):
                     st.json(rules_scenario)
         with tabs[2]:
-            st.markdown("**Simple textual diff** (non-blocking):")
+            st.markdown("**Simple textual diff**:")
             try:
-                import json, difflib
+                import difflib
                 a = json.dumps(llm_scenario or {}, indent=2, sort_keys=True).splitlines()
                 b = json.dumps(rules_scenario or {}, indent=2, sort_keys=True).splitlines()
                 diff = difflib.unified_diff(a, b, fromfile="LLM", tofile="Rules", lineterm="")
@@ -385,12 +392,13 @@ if uploaded_file:
                 st.info(f"Diff unavailable: {e}")
 
     # ---- Main Process flow ----
-    if go_clicked and (st.session_state.get("user_prompt") or "").strip():
+    if process and (st.session_state.get("user_prompt") or "").strip():
         # 1) Parse NL → Scenario JSON (LLM or rules)
         try:
-            if use_llm and parse_with_llm is not None:
-                scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023)
-                parsed_by = "GenAI"
+            if use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
+                prov = "gemini" if provider.startswith("Google") else "openai"
+                scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
+                parsed_by = provider
             else:
                 scenario = parse_rules(st.session_state["user_prompt"], dataframes, default_period=2023) if parse_rules else {}
                 parsed_by = "rules"
@@ -405,11 +413,10 @@ if uploaded_file:
         with st.expander("Advanced: show raw JSON"):
             st.json(scenario)
 
-        # Special case: "run the base model" → do not apply edits; just run optimizer
+        # Special: "run base model" → don't apply changes
         run_base = str(st.session_state["user_prompt"]).strip().lower() in {"run the base model", "run base model"}
-        dfs_to_use = dataframes if run_base else None
 
-        # 2) Apply scenario across sheets (unless running base)
+        # 2) Apply scenario to sheets (or skip if base)
         before_cpd = dataframes.get("Customer Product Data", pd.DataFrame()).copy()
         before_wh  = dataframes.get("Warehouse", pd.DataFrame()).copy()
         before_sp  = dataframes.get("Supplier Product", pd.DataFrame()).copy()
@@ -422,14 +429,14 @@ if uploaded_file:
                 st.error(f"❌ Applying scenario failed: {e}")
                 st.stop()
         else:
-            updated = dataframes  # no changes
+            updated = dataframes
 
         after_cpd = updated.get("Customer Product Data", pd.DataFrame()).copy()
         after_wh  = updated.get("Warehouse", pd.DataFrame()).copy()
         after_sp  = updated.get("Supplier Product", pd.DataFrame()).copy()
         after_tc  = updated.get("Transport Cost", pd.DataFrame()).copy()
 
-        # 2.5) Side-by-side previews (Before vs After) — still useful for base model (identical)
+        # 2.5) Quick preview
         st.subheader("📋 Before vs After (Quick Preview)")
         tabs = st.tabs(["Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
         with tabs[0]:
@@ -449,7 +456,7 @@ if uploaded_file:
             with colA: st.markdown("**Before**"); st.dataframe(before_tc.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_tc.head(25), use_container_width=True)
 
-        # 2.6) Optional: auto-connect lanes to guarantee feasibility (helpful for demos)
+        # 2.6) Auto-connect (demo feasibility)
         auto = st.checkbox(
             "🔗 Auto-create missing lanes for feasibility (demo)",
             value=True,
@@ -460,7 +467,7 @@ if uploaded_file:
             if created > 0:
                 st.info(f"Auto-connect created {created} placeholder lane(s) at Cost Per UOM = 10.0")
 
-        # 3) Optimization (quick MILP) → KPIs + flows
+        # 3) Optimization → KPIs + flows
         kpis, diag = run_optimizer(updated, period=scenario.get("period", 2023))
 
         col1, col2 = st.columns([1,1])
@@ -471,7 +478,6 @@ if uploaded_file:
             st.subheader("📝 Executive Summary")
             st.markdown(build_summary(st.session_state["user_prompt"], scenario, kpis, diag))
 
-        # Helper if infeasible / empty arcs
         status = (kpis or {}).get("status")
         if status in {"no_feasible_arcs", "no_demand", "no_positive_demand"}:
             st.warning(
@@ -489,7 +495,7 @@ if uploaded_file:
                 flows = (diag or {}).get("flows", [])
                 arcs_df = flows_to_geo(flows, updated)
                 if nodes_df.empty:
-                    st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or use recognized city names.")
+                    st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
                 else:
                     lat0, lon0 = guess_map_center(nodes_df)
                     wh_nodes = nodes_df[nodes_df["type"] == "warehouse"]
@@ -503,7 +509,7 @@ if uploaded_file:
                             get_radius=60000,
                             pickable=True,
                             filled=True,
-                            get_fill_color=[30, 136, 229],  # blue
+                            get_fill_color=[30, 136, 229],
                         ))
                     if not cu_nodes.empty:
                         layers.append(pdk.Layer(
@@ -513,7 +519,7 @@ if uploaded_file:
                             get_radius=40000,
                             pickable=True,
                             filled=True,
-                            get_fill_color=[76, 175, 80],  # green
+                            get_fill_color=[76, 175, 80],
                         ))
                     if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
                         arcs_df = arcs_df.assign(width=(arcs_df["qty"].clip(lower=1) ** 0.5))
@@ -561,7 +567,7 @@ if uploaded_file:
                 ["Mode of Transport", "Product", "From Location", "To Location", "Period"],
             )
 
-        # 6) Download updated workbook
+        # 6) Export updated workbook
         st.subheader("💾 Export")
         try:
             buf = BytesIO()
