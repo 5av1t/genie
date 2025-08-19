@@ -1,3 +1,4 @@
+# engine/optimizer.py
 from typing import Dict, Any, Tuple
 import math
 import pandas as pd
@@ -6,29 +7,52 @@ import pulp
 DEFAULT_PERIOD = 2023
 
 
+def _safe_int(val, default: int = 0) -> int:
+    """Coerce to int safely. NaN/None/invalid -> default."""
+    try:
+        if pd.isna(val):
+            return default
+        return int(float(val))
+    except Exception:
+        return default
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Coerce to finite float safely. NaN/inf/None/invalid -> default."""
+    try:
+        x = float(val)
+    except Exception:
+        return default
+    if not math.isfinite(x):
+        return default
+    return x
+
+
 def _get_warehouse_locations(wh: pd.DataFrame) -> Dict[str, str]:
     return {row["Warehouse"]: row.get("Location") for _, row in wh.iterrows()}
 
 
 def _warehouse_capacity(row) -> float:
-    available = row.get("Available (Warehouse)", 1)
-    if int(row.get("Force Close", 0) or 0) == 1 or int(available or 1) == 0:
+    """
+    Capacity respects:
+      - Force Close == 1 -> capacity 0
+      - Available (Warehouse) == 0 -> capacity 0
+      - Otherwise use Maximum Capacity (NaN -> 0)
+    """
+    fc = _safe_int(row.get("Force Close", 0), 0)
+    avail = _safe_int(row.get("Available (Warehouse)", 1), 1)
+    if fc == 1 or avail == 0:
         return 0.0
-    return float(row.get("Maximum Capacity", 0) or 0)
+    return _safe_float(row.get("Maximum Capacity", 0.0), 0.0)
 
 
 def _safe_cost(val) -> float:
-    """
-    Convert to a finite non-negative float.
-    Returns None if val is NaN/inf/negative/unusable.
-    """
+    """Return a finite, non‑negative cost; None if unusable."""
     try:
         x = float(val)
     except Exception:
         return None
-    if not math.isfinite(x):  # NaN or inf
-        return None
-    if x < 0:
+    if not math.isfinite(x) or x < 0:
         return None
     return x
 
@@ -37,14 +61,10 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     """
     Simple MILP: warehouse → customer flows by product using Transport Cost.
 
-    - Decision: x[w,c,p] >= 0 on admissible arcs (warehouse location == From Location; To Location == Customer).
+    - Decision: x[w,c,p] >= 0 on admissible arcs (warehouse Location == From Location; To Location == Customer).
     - Demand satisfaction: sum_w x[w,c,p] >= demand[c,p].
-    - Warehouse capacity: sum_{c,p} x[w,c,p] <= Maximum Capacity (respecting Force Close/Available).
+    - Warehouse capacity: sum_{c,p} x[w,c,p] <= Maximum Capacity, respecting Force Close / Available.
     - Objective: minimize sum(cost_per_uom * x).
-
-    Returns:
-      kpis: dict with status, total_cost, demand, served, etc.
-      diag: dict with binding capacities, model size, and a 'flows' list for mapping.
     """
     cpd = dfs.get("Customer Product Data")
     wh = dfs.get("Warehouse")
@@ -65,7 +85,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     for _, row in cpd_use.iterrows():
         cust = str(row.get("Customer"))
         prod = str(row.get("Product"))
-        qty = float(row.get("Demand", 0) or 0)
+        qty = _safe_float(row.get("Demand", 0.0), 0.0)
         if qty > 0:
             dem[(cust, prod)] = dem.get((cust, prod), 0.0) + qty
     if not dem:
@@ -74,10 +94,10 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     # Map warehouses to their location
     wh_locs = _get_warehouse_locations(wh)
 
-    # Build admissible arcs with finite, non-negative cost per UOM (pick min across modes/duplicates)
+    # Build admissible arcs with finite, non-negative cost per UOM (min across duplicates/modes)
     arcs: Dict[tuple, float] = {}  # (w, customer, product) -> cost
     for _, row in tc.iterrows():
-        if int(row.get("Period", period)) != period:
+        if _safe_int(row.get("Period", period), period) != period:
             continue
         w_loc = row.get("From Location")
         to_loc = row.get("To Location")
@@ -87,10 +107,9 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
 
         cost_val = _safe_cost(row.get("Cost Per UOM", 0.0))
         if cost_val is None:
-            # skip lanes with NaN/inf/negative/missing cost
             continue
 
-        # find warehouses whose Location equals From Location
+        # warehouses whose Location equals From Location
         whs = [w for w, loc in wh_locs.items() if str(loc) == str(w_loc)]
         if not whs:
             continue
@@ -100,7 +119,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
             prev = arcs.get(key)
             arcs[key] = cost_val if prev is None else min(prev, cost_val)
 
-    # Decision variables only for arcs that feed demanded (customer, product)
+    # Decision vars only for arcs that feed demanded (customer, product)
     x_vars = {
         (w, c, p): pulp.LpVariable(f"x_{w}_{c}_{p}", lowBound=0)
         for (w, c, p), cost in arcs.items()
@@ -108,10 +127,11 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     }
 
     if not x_vars:
+        total_demand = sum(dem.values())
         return {
             "status": "no_feasible_arcs",
             "total_cost": None,
-            "total_demand": sum(dem.values()),
+            "total_demand": total_demand,
             "served": 0.0,
             "service_pct": 0.0,
             "open_warehouses": int(sum(1 for _, r in wh.iterrows() if _warehouse_capacity(r) > 0)),
@@ -157,7 +177,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     binding_caps = []
     if m.status == 1:
         for w, cap in caps.items():
-            outflow = sum(v.value() for (ww, c, p), v in x_vars.items() if ww == w) or 0.0
+            outflow = sum((v.value() or 0.0) for (ww, c, p), v in x_vars.items() if ww == w)
             if cap > 0 and abs(outflow - cap) <= 1e-6:
                 binding_caps.append(w)
 
@@ -167,7 +187,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
         "total_demand": total_demand,
         "served": served,
         "service_pct": round(service_pct, 2),
-        "open_warehouses": int(sum(1 for _, row in wh.iterrows() if _warehouse_capacity(row) > 0)),
+        "open_warehouses": int(sum(1 for _, r in wh.iterrows() if _warehouse_capacity(r) > 0)),
     }
     diag = {"binding_warehouses": binding_caps[:3], "num_arcs": len(x_vars), "num_demands": len(dem), "flows": flows}
     return kpis, diag
