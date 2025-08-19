@@ -1,11 +1,10 @@
-# --- GENIE: Streamlit App (Full + GenAI vs Rules, Auto-Connect, Early Map) ---
+# --- GENIE: Streamlit App (Full + GenAI vs Rules, Auto-Connect, Early Map, Base Model Run) ---
 # Parse → Apply → (Auto-Connect Lanes) → Optimize → KPIs & Summary → Map → Delta Views → Download
 
 import os
 import sys
 from io import BytesIO
 import pandas as pd
-import openai
 
 # Streamlit import (fail clearly if missing)
 try:
@@ -21,6 +20,10 @@ except Exception:
     pdk = None
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
+
+# Inject OPENAI_API_KEY from Streamlit secrets (for GitHub→Streamlit Cloud)
+if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+    os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 
 # ========= Loader import (two styles supported) =========
 loader = None
@@ -74,13 +77,12 @@ try:
 except ModuleNotFoundError:
     missing_engine.append("engine/reporter.py (build_summary)")
 try:
-    from engine.geo import build_nodes, flows_to_geo
+    from engine.geo import build_nodes, flows_to_geo, guess_map_center
 except ModuleNotFoundError:
     missing_engine.append("engine/geo.py (build_nodes, flows_to_geo)")
 
 # GenAI (optional)
 try:
-    openai.api_key = st.secrets["openai"]["api_key"]
     from engine.genai import parse_with_llm, summarize_scenario
 except ModuleNotFoundError:
     parse_with_llm = None
@@ -106,6 +108,7 @@ Upload your base case Excel, type a what‑if scenario, and GENIE will:
 )
 
 EXAMPLES = [
+    "run the base model",
     "Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8",
     "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
     "Enable Thin-Film at Antalya_FG",
@@ -288,8 +291,7 @@ if uploaded_file:
             if nodes_df.empty:
                 st.info("No geocoded nodes available yet. Add a 'Locations' sheet with Latitude/Longitude or use recognized city names.")
             else:
-                center_lat = nodes_df["lat"].mean()
-                center_lon = nodes_df["lon"].mean()
+                lat0, lon0 = guess_map_center(nodes_df)
                 wh_nodes = nodes_df[nodes_df["type"] == "warehouse"]
                 cu_nodes = nodes_df[nodes_df["type"] == "customer"]
                 layers = []
@@ -314,7 +316,7 @@ if uploaded_file:
                         get_fill_color=[76, 175, 80],  # green
                     ))
                 deck = pdk.Deck(
-                    initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=3.2, pitch=0),
+                    initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2, pitch=0),
                     layers=layers,
                     tooltip={"html": "<b>{name}</b><br/>{location}", "style": {"color": "white"}},
                 )
@@ -324,7 +326,7 @@ if uploaded_file:
     else:
         st.info("pydeck not available in this environment, skipping map.")
 
-    # ---- Buttons ----
+    # ---- Controls ----
     colP1, colP2 = st.columns([1,1], vertical_alignment="center")
     with colP1:
         st.caption("Process with the selected parser below")
@@ -391,24 +393,31 @@ if uploaded_file:
         with st.expander("Advanced: show raw JSON"):
             st.json(scenario)
 
-        # 2) Apply scenario across sheets
+        # Special case: "run the base model" → do not apply edits; just run optimizer
+        run_base = str(st.session_state["user_prompt"]).strip().lower() in {"run the base model", "run base model"}
+        dfs_to_use = dataframes if run_base else None
+
+        # 2) Apply scenario across sheets (unless running base)
         before_cpd = dataframes.get("Customer Product Data", pd.DataFrame()).copy()
         before_wh  = dataframes.get("Warehouse", pd.DataFrame()).copy()
         before_sp  = dataframes.get("Supplier Product", pd.DataFrame()).copy()
         before_tc  = dataframes.get("Transport Cost", pd.DataFrame()).copy()
 
-        try:
-            updated = apply_scenario(dataframes, scenario)
-        except Exception as e:
-            st.error(f"❌ Applying scenario failed: {e}")
-            st.stop()
+        if not run_base:
+            try:
+                updated = apply_scenario(dataframes, scenario)
+            except Exception as e:
+                st.error(f"❌ Applying scenario failed: {e}")
+                st.stop()
+        else:
+            updated = dataframes  # no changes
 
         after_cpd = updated.get("Customer Product Data", pd.DataFrame()).copy()
         after_wh  = updated.get("Warehouse", pd.DataFrame()).copy()
         after_sp  = updated.get("Supplier Product", pd.DataFrame()).copy()
         after_tc  = updated.get("Transport Cost", pd.DataFrame()).copy()
 
-        # 2.5) Side-by-side previews (Before vs After)
+        # 2.5) Side-by-side previews (Before vs After) — still useful for base model (identical)
         st.subheader("📋 Before vs After (Quick Preview)")
         tabs = st.tabs(["Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
         with tabs[0]:
@@ -428,7 +437,7 @@ if uploaded_file:
             with colA: st.markdown("**Before**"); st.dataframe(before_tc.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_tc.head(25), use_container_width=True)
 
-        # 2.6) Optional: auto-connect lanes to guarantee feasibility
+        # 2.6) Optional: auto-connect lanes to guarantee feasibility (helpful for demos)
         auto = st.checkbox(
             "🔗 Auto-create missing lanes for feasibility (demo)",
             value=True,
@@ -455,7 +464,7 @@ if uploaded_file:
         if status in {"no_feasible_arcs", "no_demand", "no_positive_demand"}:
             st.warning(
                 "⚠️ The model couldn't route flows.\n\n"
-                "- Ensure **Transport Cost** has lanes for 2023, finite **Cost Per UOM**, and From/To locations match Warehouse.Location and Customer.\n"
+                "- Ensure **Transport Cost** has lanes for the period, finite **Cost Per UOM**, and From/To locations match Warehouse.Location and Customer.\n"
                 "- Check **Warehouse** capacity: `Maximum Capacity > 0`, `Force Close = 0`, `Available (Warehouse) = 1`.\n"
                 "- Enable **Auto-create missing lanes** for demo feasibility."
             )
@@ -470,8 +479,7 @@ if uploaded_file:
                 if nodes_df.empty:
                     st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or use recognized city names.")
                 else:
-                    center_lat = nodes_df["lat"].mean()
-                    center_lon = nodes_df["lon"].mean()
+                    lat0, lon0 = guess_map_center(nodes_df)
                     wh_nodes = nodes_df[nodes_df["type"] == "warehouse"]
                     cu_nodes = nodes_df[nodes_df["type"] == "customer"]
                     layers = []
@@ -508,7 +516,7 @@ if uploaded_file:
                             pickable=True,
                         ))
                     deck = pdk.Deck(
-                        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=3.2, pitch=0),
+                        initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2, pitch=0),
                         layers=layers,
                         tooltip={"html": "<b>{name}</b><br/>{location}", "style": {"color": "white"}},
                     )
