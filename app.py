@@ -1,47 +1,51 @@
 # --- GENIE: Streamlit App (MVP with Parsing) ---
 
-# Robust import for Streamlit
+import sys
+import pandas as pd
+
+# Streamlit import (fail clearly if missing)
 try:
     import streamlit as st
 except ModuleNotFoundError:
     print("This app requires Streamlit. Add `streamlit` to requirements.txt and redeploy.")
     raise
 
-import sys
-from engine.parser import parse_prompt
-import pandas as pd
-
-# Internal modules
-try:
-    from engine.loader import load_and_validate_excel
-    from engine.parser import parse_prompt  # <-- NEW: parser import
-except ModuleNotFoundError as e:
-    if e.name.startswith("engine"):
-        msg = (
-            "\n❌ Import error: missing engine module.\n"
-            "Ensure your repo structure is:\n\n"
-            "genie/\n"
-            "├─ app.py\n"
-            "├─ engine/\n"
-            "│  ├─ __init__.py\n"
-            "│  ├─ loader.py\n"
-            "│  └─ parser.py\n"
-            "├─ requirements.txt\n"
-            "└─ README.md\n"
-        )
-        try:
-            st.write(msg)
-        except Exception:
-            print(msg)
-        raise
-    else:
-        raise
-
-# -------------------------------- UI --------------------------------
-
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# Env health (helps debugging on Streamlit Cloud)
+# --------- Safe loader import (supports two styles) ----------
+# We support either:
+#   from engine.loader import load_and_validate_excel
+# OR
+#   from engine.loader import load_excel            (simple loader)
+loader = None
+try:
+    from engine.loader import load_and_validate_excel as loader
+except Exception:
+    try:
+        from engine.loader import load_excel as _load_excel
+        def loader(file):
+            dfs = _load_excel(file)
+            # fabricate a simple validation report if your loader doesn't validate
+            report = {name: {"missing_columns": [], "num_rows": df.shape[0], "num_columns": df.shape[1]}
+                      for name, df in dfs.items()}
+            return dfs, report
+    except Exception as e:
+        st.error("❌ Could not import a loader from engine/loader.py.\n"
+                 "Make sure one of these exists:\n"
+                 "  - load_and_validate_excel(file)\n"
+                 "  - load_excel(file)\n"
+                 f"\nImport error: {e}")
+        st.stop()
+
+# --------- Parser import ----------
+try:
+    from engine.parser import parse_prompt
+except ModuleNotFoundError as e:
+    st.error("❌ Missing `engine/parser.py`.\n"
+             "Create `engine/parser.py` with a `parse_prompt(prompt, dfs, default_period=2023)` function.")
+    st.stop()
+
+# --------- Optional env health ----------
 with st.expander("🔧 Environment health"):
     st.write({
         "python_version": sys.version.split()[0],
@@ -49,45 +53,34 @@ with st.expander("🔧 Environment health"):
         "pandas_version": pd.__version__,
     })
 
-# Title + intro
+# --------- UI ---------
 st.title("🔮 GENIE - Generative Engine for Network Intelligence & Execution")
 st.markdown(
     """
-Welcome to **GENIE** — your GenAI assistant for supply chain network design.
-
-Upload your base case Excel file, describe a scenario in natural language (e.g., _"Increase demand at Abu Dhabi by 10%"_), and GENIE will parse your intent into a structured **Scenario JSON**.  
-*(Applying updates and optimization will be added in the next steps.)*
+Upload your base case Excel, type a what‑if scenario, and GENIE will parse it into **Scenario JSON**.
+*(Applying updates & optimization comes next.)*
 """
 )
 
-st.info(
-    """
-**Example Prompt:**  
-_“Increase Mono-Crystalline demand at Abu Dhabi by 10% and set Lead Time to 8 days.”_
-"""
-)
-
-# How-to
-with st.expander("📘 How to use GENIE"):
+with st.expander("📘 How to use"):
     st.markdown(
         """
-1. **Upload** your base case Excel file (template provided below).
-2. **Enter** your 'what-if' scenario in plain English.
-3. Click **🚀 Process Scenario** to see the parsed **Scenario JSON**.
-4. Next steps will apply updates & run optimization automatically.
+1. **Upload** your base case Excel (.xlsx)
+2. **Type** a prompt, e.g.  
+   `Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8`
+3. Click **🚀 Process Scenario** to see the parsed JSON
 """
     )
 
-# Inputs
-uploaded_file = st.file_uploader("📤 Upload your base case Excel (.xlsx)", type=["xlsx"])
-user_prompt = st.text_area("🧠 Describe your what-if scenario", height=120)
+uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
+user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120)
 
-# When file is uploaded, load & validate
 if uploaded_file:
+    # ---- Load & validate ----
     try:
-        dataframes, validation_report = load_and_validate_excel(uploaded_file)
-    except ValueError as ve:
-        st.error(f"Error reading Excel: {ve}")
+        dataframes, validation_report = loader(uploaded_file)
+    except Exception as e:
+        st.error(f"❌ Error reading Excel: {e}")
         st.stop()
 
     with st.expander("✅ Sheet Validation Report"):
@@ -99,24 +92,27 @@ if uploaded_file:
 
     st.success("Base case loaded successfully.")
 
-    # 🚀 Process button (NOW ACTIVE)
+    # ---- Process button (define it BEFORE using it) ----
     process = st.button("🚀 Process Scenario")
-if process and user_prompt.strip():
-    scenario = parse_prompt(user_prompt, dataframes, default_period=2023)
-    st.subheader("Parsed Scenario JSON")
-    st.json(scenario)
-        # (Step 2 will apply these changes to DataFrames; Step 3 will optimize)
+
+    if process and user_prompt.strip():
+        try:
+            scenario = parse_prompt(user_prompt, dataframes, default_period=2023)
+        except Exception as e:
+            st.error(f"❌ Parsing failed: {e}")
+            st.stop()
+
+        st.subheader("Parsed Scenario JSON")
+        st.json(scenario)
 else:
-    # Provide a real download if the sample file exists in the repo
+    # Optional sample download
     try:
         with open("sample_base_case.xlsx", "rb") as f:
             st.download_button(
-                label="⬇️ Download Sample Base Case Template",
-                data=f,
+                "⬇️ Download Sample Base Case Template",
+                f,
                 file_name="sample_base_case.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
     except FileNotFoundError:
-        st.warning(
-            "Sample base case not found in the repo. Upload your own Excel or add `sample_base_case.xlsx` to the repo root."
-        )
+        st.info("Add a `sample_base_case.xlsx` to the repo root to enable a sample download.")
