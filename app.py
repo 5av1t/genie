@@ -275,15 +275,12 @@ if uploaded_file:
         st.stop()
 
     with st.expander("✅ Sheet Validation Report"):
-    # First: per-sheet reports (dict entries)
-        for sheet, rep in validation_report.items():
-            if sheet == "_warnings" or not isinstance(rep, dict):
-                continue  # skip warnings list or any non-dict
-                missing = rep.get("missing_columns", [])
-            if missing:
-                st.error(f"{sheet}: Missing columns - {missing}")
+        for sheet, report in validation_report.items():
+            if report.get("missing_columns"):
+                st.error(f"{sheet}: Missing columns - {report['missing_columns']}")
             else:
-                st.success(f"{sheet}: OK ({rep.get('num_rows', 0)} rows, {rep.get('num_columns', 0)} columns)")
+                st.success(f"{sheet}: OK ({report['num_rows']} rows, {report['num_columns']} columns)")
+
 
     # Then: global warnings list
     warns = validation_report.get("_warnings", [])
