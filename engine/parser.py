@@ -1,93 +1,109 @@
+from typing import Dict, Any, List
 import re
-from typing import Dict, Any, List, Set
-from .schema import empty_scenario, validate_scenario, DEFAULT_PERIOD
+import pandas as pd
+
+DEFAULT_PERIOD = 2023
 
 def _vals(df, col) -> List[str]:
     if df is None or col not in df.columns:
         return []
     return sorted({str(x) for x in df[col].dropna().tolist()})
 
-def build_catalog(dfs: Dict[str, Any]) -> Dict[str, Set[str]]:
-    products = set(_vals(dfs.get("Products"), "Product"))
-    customers = set(_vals(dfs.get("Customers"), "Customer"))
-    warehouses = set(_vals(dfs.get("Warehouse"), "Warehouse"))
-    suppliers = set(_vals(dfs.get("Supplier"), "Supplier"))
-    modes = set(_vals(dfs.get("Mode of Transport"), "Mode of Transport"))
-    locations = set(_vals(dfs.get("Warehouse"), "Location")) | set(_vals(dfs.get("Customers"), "Location"))
+def _catalog(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
     return {
-        "products": products,
-        "customers": customers,
-        "warehouses": warehouses,
-        "suppliers": suppliers,
-        "modes": modes,
-        "locations": locations,
+        "products": _vals(dfs.get("Products"), "Product"),
+        "customers": _vals(dfs.get("Customers"), "Customer"),
+        "warehouses": _vals(dfs.get("Warehouse"), "Warehouse"),
+        "suppliers": _vals(dfs.get("Supplier Product"), "Supplier"),
+        "modes": _vals(dfs.get("Mode of Transport"), "Mode of Transport"),
+        "locations": sorted(
+            set(_vals(dfs.get("Warehouse"), "Location")) |
+            set(_vals(dfs.get("Customers"), "Location")) |
+            set(_vals(dfs.get("Customers"), "Customer"))
+        ),
     }
 
-def parse_prompt(prompt: str, dfs: Dict[str, Any], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
-    s = empty_scenario(default_period)
-    text = (prompt or "").strip()
-    catalog = build_catalog(dfs)
+def _base_scenario(period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
+    return {"period": period, "demand_updates": [], "warehouse_changes": [], "supplier_changes": [], "transport_updates": []}
 
-    # Demand change with optional period + lead time
-    dem_pat = re.compile(
-        r"(increase|decrease)\s+([A-Za-z0-9\- ]+)\s+demand\s+at\s+([A-Za-z0-9\-_ ]+)\s+by\s+(\d+)\s*%?(?:.*?\b(\d{4})\b)?",
-        re.IGNORECASE,
-    )
-    for m in dem_pat.finditer(text):
-        direction, product, location, pct, period_opt = m.groups()
-        product = product.strip(); location = location.strip()
-        if product not in catalog["products"] or location not in catalog["customers"]:
-            continue
-        delta = int(pct)
-        if direction.lower().startswith("decrease"):
-            delta = -delta
-        period_val = int(period_opt) if period_opt else default_period
-        upd = {"product": product, "customer": location, "location": location, "delta_pct": delta}
-        lt_m = re.search(r"set\s+lead\s*time\s*to\s*(\d+)", text, flags=re.IGNORECASE)
-        if lt_m:
-            upd["set"] = {"Lead Time": int(lt_m.group(1))}
-        s["period"] = period_val
-        s["demand_updates"].append(upd)
+def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
+    """Lightweight rules parser for validated examples + common edits."""
+    if not prompt:
+        return _base_scenario(default_period)
+    text = prompt.strip()
 
-    # Warehouse capacity cap
-    cap_pat = re.compile(r"cap\s+([A-Za-z0-9_\-]+)\s+maximum\s+capacity\s+at\s+(\d+)", re.IGNORECASE)
-    for m in cap_pat.finditer(text):
-        wh, val = m.groups()
-        if wh in catalog["warehouses"]:
-            s["warehouse_changes"].append({"warehouse": wh, "field": "Maximum Capacity", "new_value": int(val)})
+    # "run base model"
+    if text.lower() in {"run base model", "run the base model"}:
+        s = _base_scenario(default_period)
+        s["meta"] = {"run_base": True}
+        return s
 
-    # Force open/close
-    for phrase, field in [("force close", "Force Close"), ("force open", "Force Open")]:
-        pat = re.compile(phrase + r"\s+([A-Za-z0-9_\-]+)", re.IGNORECASE)
-        for m in pat.finditer(text):
-            wh = m.group(1)
-            if wh in catalog["warehouses"]:
-                s["warehouse_changes"].append({"warehouse": wh, "field": field, "new_value": 1})
+    cats = _catalog(dfs)
+    s = _base_scenario(default_period)
 
-    # Supplier enable
-    sup_pat = re.compile(r"enable\s+([A-Za-z0-9\- ]+)\s+at\s+([A-Za-z0-9_\-]+)", re.IGNORECASE)
-    for m in sup_pat.finditer(text):
-        prod, sup = m.groups()
+    # Period override if any 4-digit year appears
+    m_year = re.search(r"\b(20\d{2})\b", text)
+    if m_year:
+        s["period"] = int(m_year.group(1))
+
+    # Demand increase/decrease by %
+    # e.g., Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8
+    dm = re.search(r"(increase|decrease)\s+([A-Za-z0-9\-\s]+)\s+demand\s+at\s+([A-Za-z0-9\-\s]+)\s+by\s+(\d+(?:\.\d+)?)\s*%", text, re.I)
+    if dm:
+        kind, prod, cust, pct = dm.groups()
         prod = prod.strip()
-        if prod in catalog["products"] and sup in catalog["suppliers"]:
-            s["supplier_changes"].append({"product": prod, "supplier": sup, "location": sup, "field": "Available", "new_value": 1})
+        cust = cust.strip()
+        if prod in cats["products"] and cust in cats["customers"]:
+            delta = float(pct) * (1 if kind.lower()=="increase" else -1)
+            upd = {"product": prod, "customer": cust, "location": cust, "delta_pct": delta}
+            # Check for "set lead time to N"
+            m_lt = re.search(r"set\s+lead\s*time\s+to\s+(\d+)", text, re.I)
+            if m_lt:
+                upd["set"] = {"Lead Time": float(m_lt.group(1))}
+            s["demand_updates"].append(upd)
+
+    # Warehouse changes
+    # Cap Bucharest_CDC Maximum Capacity at 25000
+    m_cap = re.search(r"cap\s+([A-Za-z0-9\-_]+)\s+maximum\s+capacity\s+at\s+(\d+(?:\.\d+)?)", text, re.I)
+    if m_cap:
+        wh, val = m_cap.groups()
+        wh = wh.strip()
+        if wh in cats["warehouses"]:
+            s["warehouse_changes"].append({"warehouse": wh, "field": "Maximum Capacity", "new_value": float(val)})
+
+    for cmd, fld in [("force close", "Force Close"), ("force open", "Force Open")]:
+        m_fc = re.search(rf"{cmd}\s+([A-Za-z0-9\-_]+)", text, re.I)
+        if m_fc:
+            wh = m_fc.group(1).strip()
+            if wh in cats["warehouses"]:
+                s["warehouse_changes"].append({"warehouse": wh, "field": fld, "new_value": 1})
+
+    # Supplier enablement
+    # Enable Thin-Film at Antalya_FG (and Krems_FG)
+    for sup in cats["suppliers"]:
+        m_en = re.search(rf"enable\s+([A-Za-z0-9\-\s]+)\s+at\s+{re.escape(sup)}", text, re.I)
+        if m_en:
+            prod = m_en.group(1).strip()
+            if prod in cats["products"]:
+                s["supplier_changes"].append({"product": prod, "supplier": sup, "location": sup, "field": "Available", "new_value": 1})
 
     # Transport lane cost
-    trans_pat = re.compile(
-        r"set\s+([A-Za-z0-9_ \-]+)\s+lane\s+([A-Za-z0-9_\-]+)\s*→\s*([A-Za-z0-9_\-]+)\s+for\s+([A-Za-z0-9\- ]+)\s+to\s+cost\s+per\s+uom\s*=\s*(\d+(?:\.\d+)?)",
-        re.IGNORECASE,
+    # Set Secondary Delivery LTL lane Paris_CDC → Aalborg for Poly-Crystalline to cost per uom = 9.5
+    m_tc = re.search(
+        r"set\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s]+)\s+for\s+([A-Za-z0-9\-\s]+)\s+to\s+cost\s+per\s+uom\s*=?\s*(\d+(?:\.\d+)?)",
+        text, re.I
     )
-    for m in trans_pat.finditer(text):
-        mode, frm, to, prod, cost = m.groups()
-        mode = mode.strip(); prod = prod.strip()
-        if (mode in catalog["modes"] and frm in catalog["locations"] and to in catalog["locations"] and prod in catalog["products"]):
+    if m_tc:
+        mode, fr, to, prod, cost = m_tc.groups()
+        mode = mode.strip(); fr = fr.strip(); to = to.strip(); prod = prod.strip()
+        if mode in cats["modes"] and prod in cats["products"] and fr in cats["locations"] and to in cats["customers"]:
             s["transport_updates"].append({
                 "mode": mode,
                 "product": prod,
-                "from_location": frm,
+                "from_location": fr,
                 "to_location": to,
-                "period": default_period,
-                "fields": {"Cost Per UOM": float(cost), "Available": 1},
+                "period": s["period"],
+                "fields": {"Cost Per UOM": float(cost), "Available": 1}
             })
 
-    return validate_scenario(s)
+    return s
