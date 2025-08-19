@@ -29,7 +29,14 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def _get_warehouse_locations(wh: pd.DataFrame) -> Dict[str, str]:
-    return {row["Warehouse"]: row.get("Location") for _, row in wh.iterrows()}
+    if wh is None or wh.empty:
+        return {}
+    out = {}
+    for _, row in wh.iterrows():
+        w = str(row.get("Warehouse"))
+        loc = row.get("Location")
+        out[w] = str(loc) if pd.notna(loc) else w
+    return out
 
 
 def _warehouse_capacity(row) -> float:
@@ -61,10 +68,11 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     """
     Simple MILP: warehouse → customer flows by product using Transport Cost.
 
-    - Decision: x[w,c,p] >= 0 on admissible arcs (warehouse Location == From Location; To Location == Customer).
-    - Demand satisfaction: sum_w x[w,c,p] >= demand[c,p].
-    - Warehouse capacity: sum_{c,p} x[w,c,p] <= Maximum Capacity, respecting Force Close / Available.
-    - Objective: minimize sum(cost_per_uom * x).
+    Decision vars: x[w,c,p] >= 0 on admissible arcs (warehouse Location == From Location; To Location == Customer).
+    Constraints:
+      - Demand satisfaction: sum_w x[w,c,p] >= demand[c,p]
+      - Warehouse capacity: sum_{c,p} x[w,c,p] <= Maximum Capacity, respecting Force Close/Available
+    Objective: minimize sum(cost_per_uom * x)
     """
     cpd = dfs.get("Customer Product Data")
     wh = dfs.get("Warehouse")
@@ -81,7 +89,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
         return {"status": "no_demand"}, {"note": "No demand rows for selected period", "flows": []}
 
     # Build demand per (customer, product)
-    dem = {}
+    dem: Dict[Tuple[str, str], float] = {}
     for _, row in cpd_use.iterrows():
         cust = str(row.get("Customer"))
         prod = str(row.get("Product"))
@@ -95,29 +103,31 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     wh_locs = _get_warehouse_locations(wh)
 
     # Build admissible arcs with finite, non-negative cost per UOM (min across duplicates/modes)
-    arcs: Dict[tuple, float] = {}  # (w, customer, product) -> cost
-    for _, row in tc.iterrows():
-        if _safe_int(row.get("Period", period), period) != period:
-            continue
-        w_loc = row.get("From Location")
-        to_loc = row.get("To Location")
-        prod = row.get("Product")
-        if pd.isna(w_loc) or pd.isna(to_loc) or pd.isna(prod):
-            continue
+    arcs: Dict[Tuple[str, str, str], float] = {}  # (warehouse, customer, product) -> cost
+    if not tc.empty:
+        for _, row in tc.iterrows():
+            # Period filter (safe int)
+            if _safe_int(row.get("Period", period), period) != period:
+                continue
+            w_from = row.get("From Location")
+            to_loc = row.get("To Location")
+            prod = row.get("Product")
+            if pd.isna(w_from) or pd.isna(to_loc) or pd.isna(prod):
+                continue
 
-        cost_val = _safe_cost(row.get("Cost Per UOM", 0.0))
-        if cost_val is None:
-            continue
+            cost_val = _safe_cost(row.get("Cost Per UOM", 0.0))
+            if cost_val is None:
+                continue
 
-        # warehouses whose Location equals From Location
-        whs = [w for w, loc in wh_locs.items() if str(loc) == str(w_loc)]
-        if not whs:
-            continue
+            # warehouses whose Location equals From Location
+            wlist = [w for w, loc in wh_locs.items() if str(loc) == str(w_from)]
+            if not wlist:
+                continue
 
-        for w in whs:
-            key = (w, str(to_loc), str(prod))
-            prev = arcs.get(key)
-            arcs[key] = cost_val if prev is None else min(prev, cost_val)
+            for w in wlist:
+                key = (w, str(to_loc), str(prod))
+                prev = arcs.get(key)
+                arcs[key] = cost_val if prev is None else min(prev, cost_val)
 
     # Decision vars only for arcs that feed demanded (customer, product)
     x_vars = {
@@ -134,14 +144,14 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
             "total_demand": total_demand,
             "served": 0.0,
             "service_pct": 0.0,
-            "open_warehouses": int(sum(1 for _, r in wh.iterrows() if _warehouse_capacity(r) > 0)),
+            "open_warehouses": int(sum(1 for _, r in (wh if wh is not None else pd.DataFrame()).iterrows() if _warehouse_capacity(r) > 0)),
         }, {"note": "No admissible arcs with finite costs for the demanded pairs", "flows": [], "num_arcs": 0, "num_demands": len(dem)}
 
     # Model
     m = pulp.LpProblem("genie_network", pulp.LpMinimize)
 
     # Objective
-    m += pulp.lpSum(arcs[(w, c, p)] * var for (w, c, p), var in x_vars.items())
+    m += pulp.lpSum(_safe_float(arcs[(w, c, p)], 0.0) * var for (w, c, p), var in x_vars.items())
 
     # Demand satisfaction
     for (c, p), qty in dem.items():
@@ -150,7 +160,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
             m += pulp.lpSum(incoming) >= qty, f"demand_{c}_{p}"
 
     # Warehouse capacity
-    caps = {row["Warehouse"]: _warehouse_capacity(row) for _, row in wh.iterrows()}
+    caps = {row["Warehouse"]: _warehouse_capacity(row) for _, row in wh.iterrows()} if wh is not None else {}
     for w, cap in caps.items():
         outflow = [x_vars[(ww, c, p)] for (ww, c, p) in x_vars if ww == w]
         if outflow:
@@ -187,7 +197,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
         "total_demand": total_demand,
         "served": served,
         "service_pct": round(service_pct, 2),
-        "open_warehouses": int(sum(1 for _, r in wh.iterrows() if _warehouse_capacity(r) > 0)),
+        "open_warehouses": int(sum(1 for _, row in (wh if wh is not None else pd.DataFrame()).iterrows() if _warehouse_capacity(row) > 0)),
     }
     diag = {"binding_warehouses": binding_caps[:3], "num_arcs": len(x_vars), "num_demands": len(dem), "flows": flows}
     return kpis, diag
