@@ -1,11 +1,14 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
-.env
+
+# Streamlit local state & secrets
+.streamlit/secrets.toml
+
+# OS
 .DS_Store
 Thumbs.db
-.ipynb_checkpoints/
-.streamlit/
-*.xlsx~
-~$*.xlsx
