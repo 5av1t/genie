@@ -7,7 +7,7 @@ from io import BytesIO
 import pandas as pd
 import openai
 
-openai.api_key = st.secrets["openai"]["api_key"]
+
 # Streamlit import (fail clearly if missing)
 try:
     import streamlit as st
@@ -81,6 +81,7 @@ except ModuleNotFoundError:
 
 # GenAI (optional)
 try:
+    openai.api_key = st.secrets["openai"]["api_key"]
     from engine.genai import parse_with_llm, summarize_scenario
 except ModuleNotFoundError:
     parse_with_llm = None
