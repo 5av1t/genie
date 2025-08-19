@@ -106,13 +106,21 @@ if uploaded_file:
         st.json(scenario)
 else:
     # Optional sample download
-    try:
-        with open("sample_base_case.xlsx", "rb") as f:
-            st.download_button(
-                "⬇️ Download Sample Base Case Template",
-                f,
-                file_name="sample_base_case.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    import io, requests, streamlit as st
+
+raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
+try:
+    r = requests.get(raw_url, timeout=10)
+    r.raise_for_status()
+    buf = io.BytesIO(r.content)
+    st.download_button(
+        "⬇️ Download Sample Base Case Template",
+        buf.getvalue(),
+        file_name="sample_base_case.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+except Exception as e:
+    st.warning(f"Template download failed from GitHub raw: {e}")
+    st.markdown(f"Try opening it directly: [{raw_url}]({raw_url})")
     except FileNotFoundError:
         st.info("Add a `sample_base_case.xlsx` to the repo root to enable a sample download.")
