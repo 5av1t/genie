@@ -3,7 +3,6 @@ import pandas as pd
 
 DEFAULT_PERIOD = 2023
 
-# Required columns per sheet
 REQ = {
     "Customers": ["Customer", "Location"],
     "Warehouse": ["Warehouse", "Location"],
@@ -12,7 +11,7 @@ REQ = {
     "Products": ["Product"],
     "Supplier Product": ["Product", "Supplier", "Location", "Period", "Available"],
     "Mode of Transport": ["Mode of Transport"],
-    "Periods": ["Start Date", "End Date"],  # permissive; we coerce Period elsewhere
+    "Periods": ["Start Date", "End Date"],
 }
 
 ALIAS_MAP = {
@@ -37,7 +36,6 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=ren)
 
 def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    # Customer Product Data
     cpd = dfs.get("Customer Product Data")
     if isinstance(cpd, pd.DataFrame) and not cpd.empty:
         if "Period" not in cpd.columns:
@@ -48,7 +46,6 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         cpd["Period"] = pd.to_numeric(cpd["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
         dfs["Customer Product Data"] = cpd
 
-    # Warehouse
     wh = dfs.get("Warehouse")
     if isinstance(wh, pd.DataFrame) and not wh.empty:
         if "Available (Warehouse)" not in wh.columns:
@@ -60,7 +57,6 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
             wh["Period"] = pd.to_numeric(wh["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
         dfs["Warehouse"] = wh
 
-    # Supplier Product
     sp = dfs.get("Supplier Product")
     if isinstance(sp, pd.DataFrame) and not sp.empty:
         if "Period" not in sp.columns:
@@ -70,7 +66,6 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         sp["Period"] = pd.to_numeric(sp["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
         dfs["Supplier Product"] = sp
 
-    # Transport Cost
     tc = dfs.get("Transport Cost")
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         if "Period" not in tc.columns:
@@ -98,24 +93,20 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             "sheet_missing": False,
         }
 
-    # Warnings
     warn = []
 
-    # Negative capacities
     wh = dfs.get("Warehouse")
     if isinstance(wh, pd.DataFrame) and "Maximum Capacity" in wh.columns:
         neg = wh[pd.to_numeric(wh["Maximum Capacity"], errors="coerce").fillna(0) < 0]
         if not neg.empty:
             warn.append(f"Warehouse: {len(neg)} row(s) with negative Maximum Capacity.")
 
-    # Non-positive demand
     cpd = dfs.get("Customer Product Data")
     if isinstance(cpd, pd.DataFrame) and "Demand" in cpd.columns:
         npd = cpd[pd.to_numeric(cpd["Demand"], errors="coerce").fillna(0) <= 0]
         if not npd.empty:
             warn.append(f"Customer Product Data: {len(npd)} row(s) with non-positive Demand.")
 
-    # Orphan lanes: From must be Warehouse.Location; To can be Customers.Customer OR CPD.Customer/Location
     tc = dfs.get("Transport Cost")
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         wh_locs = set()
