@@ -1,6 +1,5 @@
 # app.py — GENIE: Supply Chain Network Designer
 # Upload → Validate → Nodes map → Scenario (Rules/LLM) → Apply edits → Optimize → KPIs + Flow map → Q&A → Download
-
 from __future__ import annotations
 import os
 import io
@@ -11,6 +10,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import pydeck as pdk
+import requests
 
 # ------------------------------ App Config ------------------------------
 st.set_page_config(
@@ -52,7 +52,7 @@ except ModuleNotFoundError:
     missing_engine.append("engine/updater.py (apply_scenario_edits, diff_tables)")
 
 try:
-    from engine.optimizer import run_optimizer  # <-- correct function
+    from engine.optimizer import run_optimizer
 except ModuleNotFoundError:
     run_optimizer = None  # type: ignore
     missing_engine.append("engine/optimizer.py (run_optimizer)")
@@ -73,6 +73,13 @@ except ModuleNotFoundError:
     answer_question = None  # type: ignore
     suggest_location_candidates = None  # type: ignore
     missing_engine.append("engine/genai.py (parse_with_llm, answer_question, suggest_location_candidates)")
+
+try:
+    from engine.examples import rules_examples, llm_examples
+except ModuleNotFoundError:
+    rules_examples = None  # type: ignore
+    llm_examples = None  # type: ignore
+    missing_engine.append("engine/examples.py (rules_examples, llm_examples)")
 
 # ------------------------------ Helpers ------------------------------
 def _downloadable_excel(dfs: Dict[str, pd.DataFrame], filename: str = "scenario.xlsx") -> Tuple[bytes, str]:
@@ -161,6 +168,7 @@ for k, v in {
     "diag": {},
     "user_prompt": "",
     "qa_input": "",
+    "pending_prompt": None,
 }.items():
     if k not in ss:
         ss[k] = v
@@ -173,7 +181,6 @@ with st.sidebar:
 
     # Robust sample download: try to fetch bytes else show link button
     try:
-        import requests
         r = requests.get(sample_url, timeout=10, headers={"User-Agent": "genie-app"})
         if r.ok and r.content:
             st.download_button(
@@ -255,11 +262,24 @@ st.markdown("---")
 # ------------------------------ Scenario Editor ------------------------------
 st.subheader("🧪 Scenario Editor")
 
+# If an example was chosen in prior run, adopt it BEFORE rendering the text area
+if ss.get("pending_prompt"):
+    ss["user_prompt"] = ss.pop("pending_prompt", "")
+
 left, right = st.columns([2, 1])
 
 with left:
+    # Dynamic examples from the uploaded file (no hard-coded products)
+    st.markdown("**Insert an example from your file**")
+    dyn_rules = rules_examples(ss["dfs"]) if rules_examples else []
+    ex_choice = st.selectbox("Examples (dynamic)", ["(choose one)"] + dyn_rules, index=0, key="ex_choice_rules")
+    if st.button("Insert example"):
+        if ex_choice and ex_choice != "(choose one)":
+            # Set pending so we don't mutate after widget creation
+            ss["pending_prompt"] = ex_choice
+            st.experimental_rerun()
+
     st.markdown("**Write prompt** (natural language)")
-    # Use stable key, do not reassign after render
     user_prompt_val = ss.get("user_prompt", "")
     user_prompt = st.text_area(
         "Describe your what-if...",
@@ -268,11 +288,6 @@ with left:
         key="user_prompt",
         label_visibility="collapsed",
     )
-    st.caption("Examples:")
-    st.code("Increase Mono-Crystalline demand at Abu Dhabi by 10% and set Lead Time to 8", language="text")
-    st.code("Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC", language="text")
-    st.code("Enable Thin-Film at Antalya_FG", language="text")
-    st.code("Set Secondary Delivery LTL lane Paris_CDC → Aalborg for Poly-Crystalline to cost per uom = 9.5", language="text")
 
 with right:
     st.markdown("**Parser**")
