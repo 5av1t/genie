@@ -1,16 +1,17 @@
-# --- GENIE: Supply Chain Network Designer ---
+# --- GENIE: Supply Chain Network Designer (complete app.py) ---
 # Upload Excel → (Prompt OR Manual CRUD) → Apply → Optimize → KPIs + Maps → Q&A → Export
 
 import os
 from io import BytesIO
 import json
 import hashlib
+import math
 import pandas as pd
 
 try:
     import streamlit as st
 except ModuleNotFoundError:
-    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt and deploy again.")
+    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt and redeploy.")
     raise
 
 try:
@@ -20,7 +21,7 @@ except Exception:
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# --- Load secrets (never display) ---
+# --- Load secrets (kept hidden) ---
 for block in ("openai", "gcp", "gemini"):
     if block in st.secrets:
         for k, v in st.secrets[block].items():
@@ -89,6 +90,7 @@ with st.sidebar:
     )
     use_llm_parser = st.checkbox("Use GenAI parser for scenarios", value=(provider != "Rules only (no LLM)"))
     show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False)
+
     st.markdown("---")
     st.subheader("🧠 GENIE can:")
     st.markdown(
@@ -106,7 +108,7 @@ with st.sidebar:
 # --- Upload ---
 uploaded = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
 
-# --- Utils for delta views ---
+# --- Helpers (delta & autoconnect) ---
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, keys: list) -> pd.DataFrame:
     if after is None or not isinstance(after, pd.DataFrame) or after.empty:
         return pd.DataFrame(columns=keys + ["Field","Before","After","ChangeType"])
@@ -185,7 +187,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     dfs["Transport Cost"] = tc
     return dfs, len(new_rows)
 
-# Static examples for when we can't read from file yet
+# Static examples
 STATIC_EXAMPLES = [
     "run the base model",
     "Increase demand at a specific customer by 10% and set lead time to 8",
@@ -310,7 +312,7 @@ if uploaded:
                 set_abs = st.number_input("Set absolute Demand (overrides Δ%, optional)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
             lt = st.number_input("Set Lead Time (optional)", min_value=0, value=0, step=1)
             if st.button("➕ Queue demand update"):
-                loc_final = loc.strip() or (c if isinstance(c, str) else "")
+                loc_final = (loc.strip() or (c if isinstance(c, str) else ""))
                 ed = {"product": str(p), "customer": str(c), "location": str(loc_final)}
                 if set_abs > 0:
                     ed["set"] = {"Demand": float(set_abs)}
@@ -362,7 +364,7 @@ if uploaded:
                 field = st.selectbox("Field", ["Maximum Capacity","Fixed Cost","Variable Cost","Force Open","Force Close"], key="crud_wh_field")
                 newv = st.text_input("New value (number or 0/1 for Force)", key="crud_wh_val")
                 if st.button("➕ Queue warehouse update"):
-                    v = float(newv) if field in {"Maximum Capacity","Fixed Cost","Variable Cost"} else int(float(newv))
+                    v = float(newv) if field in {"Maximum Capacity","Fixed Cost","Variable Cost"} else int(float(newv or 0))
                     scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
                     scn.setdefault("warehouse_changes", []).append({"warehouse": uw, "field": field, "new_value": v})
                     st.success(f"Queued: {uw} {field} -> {v}")
@@ -474,7 +476,6 @@ if uploaded:
         # 2) Merge Manual Edits (if any)
         manual = st.session_state.get("manual_scenario", {})
         scenario = {}
-        # shallow merge period + list fields
         scenario["period"] = (manual.get("period") or prompt_scn.get("period") or 2023)
         for key in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
             scenario[key] = []
@@ -507,7 +508,7 @@ if uploaded:
         b_tc  = dfs.get("Transport Cost", pd.DataFrame()).copy()
         b_cu  = dfs.get("Customers", pd.DataFrame()).copy()
 
-        # 5) Apply
+        # 5) Apply scenario
         try:
             newdfs = apply_scenario(dfs, scenario, allow_delete=allow_delete)
         except Exception as e:
@@ -529,7 +530,7 @@ if uploaded:
         if run_optimizer is None: st.error("Optimizer module missing."); st.stop()
         kpis, diag = run_optimizer(newdfs, period=scenario.get("period", 2023))
 
-        # Persist so Q&A won’t reset on rerun
+        # Persist latest results so Q&A won’t reset on reruns
         st.session_state["last_newdfs"] = newdfs
         st.session_state["last_kpis"]   = kpis
         st.session_state["last_diag"]   = diag
@@ -573,7 +574,7 @@ if uploaded:
         except Exception as e:
             st.info(f"Diagnostics unavailable: {e}")
 
-        # 10) Map with flows (ONLY solver flows; proper tooltip)
+        # 10) Map with flows (thin lines + color by product + legend)
         st.subheader("🌍 Network Map (With Flows)")
         if pdk and build_nodes and flows_to_geo and guess_map_center:
             try:
@@ -588,29 +589,103 @@ if uploaded:
                     wh = nodes_df[nodes_df["type"]=="warehouse"]; cu = nodes_df[nodes_df["type"]=="customer"]
                     layers=[]
                     if not wh.empty:
-                        layers.append(pdk.Layer("ScatterplotLayer", data=wh, get_position='[lon, lat]', get_radius=60000, pickable=True, filled=True, get_fill_color=[30,136,229]))
+                        layers.append(
+                            pdk.Layer(
+                                "ScatterplotLayer",
+                                data=wh, get_position='[lon, lat]',
+                                get_radius=45000, pickable=True, filled=True,
+                                get_fill_color=[30,136,229],
+                            )
+                        )
                     if not cu.empty:
-                        layers.append(pdk.Layer("ScatterplotLayer", data=cu, get_position='[lon, lat]', get_radius=40000, pickable=True, filled=True, get_fill_color=[76,175,80]))
+                        layers.append(
+                            pdk.Layer(
+                                "ScatterplotLayer",
+                                data=cu, get_position='[lon, lat]',
+                                get_radius=30000, pickable=True, filled=True,
+                                get_fill_color=[76,175,80],
+                            )
+                        )
+
                     if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
                         arcs_df = arcs_df[arcs_df["qty"] > 1e-9].copy()
                         if not arcs_df.empty:
-                            arcs_df["width"] = (arcs_df["qty"].clip(lower=1.0)) ** 0.5
-                            layers.append(pdk.Layer(
-                                "ArcLayer",
-                                data=arcs_df,
-                                get_source_position='[from_lon, from_lat]',
-                                get_target_position='[to_lon, to_lat]',
-                                get_width='width',
-                                get_source_color=[255,140,0],
-                                get_target_color=[255,64,64],
-                                pickable=True,
-                            ))
-                    deck=pdk.Deck(
-                        initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2),
+                            qmax = float(arcs_df["qty"].max())
+                            arcs_df["width"] = 1.0 if qmax <= 0 else (1.0 + 5.0 * (arcs_df["qty"] / qmax).clip(0, 1))
+
+                            base_palette = [
+                                (230, 25, 75),   # red
+                                (60, 180, 75),   # green
+                                (0, 130, 200),   # blue
+                                (245, 130, 48),  # orange
+                                (145, 30, 180),  # purple
+                                (70, 240, 240),  # cyan
+                                (240, 50, 230),  # magenta
+                                (210, 245, 60),  # lime
+                                (250, 190, 190), # pink
+                                (0, 128, 128),   # teal
+                            ]
+                            prod_colors = {}
+
+                            def color_for(prod: str):
+                                if prod in prod_colors:
+                                    return prod_colors[prod]
+                                if len(prod_colors) < len(base_palette):
+                                    prod_colors[prod] = base_palette[len(prod_colors)]
+                                else:
+                                    # stable hash → HSV → RGB
+                                    h = abs(hash(prod)) % 360
+                                    import colorsys
+                                    r, g, b = colorsys.hsv_to_rgb(h/360.0, 0.7, 1.0)
+                                    prod_colors[prod] = (int(r*255), int(g*255), int(b*255))
+                                return prod_colors[prod]
+
+                            arcs_df["rgb"] = arcs_df["product"].fillna("Unknown").map(color_for)
+                            arcs_df["color"] = arcs_df["rgb"].apply(lambda t: [int(t[0]), int(t[1]), int(t[2])])
+
+                            layers.append(
+                                pdk.Layer(
+                                    "ArcLayer",
+                                    data=arcs_df,
+                                    get_source_position='[from_lon, from_lat]',
+                                    get_target_position='[to_lon, to_lat]',
+                                    get_width='width',
+                                    get_source_color='color',
+                                    get_target_color='color',
+                                    pickable=True,
+                                )
+                            )
+
+                    deck = pdk.Deck(
+                        initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.3),
                         layers=layers,
-                        tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/>{product}: {qty}","style":{"color":"white"}}
+                        tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/><i>{product}</i>: {qty}", "style":{"color":"white"}},
+                        map_style="dark",
                     )
                     st.pydeck_chart(deck)
+
+                    # Legend
+                    try:
+                        if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
+                            legend_rows = (
+                                arcs_df[["product", "color"]]
+                                .drop_duplicates()
+                                .sort_values("product")
+                                .values.tolist()
+                            )
+                            if legend_rows:
+                                html = "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
+                                for prod, col in legend_rows:
+                                    r, g, b = col
+                                    html += (
+                                        "<div style='display:flex;align-items:center;gap:6px; margin:2px 6px;'>"
+                                        f"<span style='display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:2px;'></span>"
+                                        f"<span style='font-size:12px;'>{prod}</span></div>"
+                                    )
+                                html += "</div>"
+                                st.markdown(html, unsafe_allow_html=True)
+                    except Exception:
+                        pass
 
                     if (diag or {}).get("flows", []) and (arcs_df is None or arcs_df.empty):
                         st.warning("Flows exist but none were plotted. Ensure warehouse/customer names resolve to coordinates (Locations sheet or known city names).")
@@ -661,8 +736,15 @@ if uploaded:
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
                 for name, df in newdfs.items():
                     if isinstance(df, pd.DataFrame):
-                        df.to_excel(w, sheet_name=str(name)[:31] or "Sheet", index=False)
-            st.download_button("Download Updated Scenario Excel", data=buf.getvalue(), file_name="genie_updated_scenario.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        # Excel sheet names are max 31 chars
+                        sname = str(name)[:31] or "Sheet"
+                        df.to_excel(w, sheet_name=sname, index=False)
+            st.download_button(
+                "Download Updated Scenario Excel",
+                data=buf.getvalue(),
+                file_name="genie_updated_scenario.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         except Exception as e:
             st.warning(f"Creating the Excel download failed: {e}")
 
