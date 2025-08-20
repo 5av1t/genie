@@ -1,113 +1,157 @@
-from __future__ import annotations
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Tuple, Any
 import pandas as pd
 
 DEFAULT_PERIOD = 2023
 
-# Canonical sheet names we expose to the rest of the app
-CANON = {
-    "Products": ["products", "product", "items"],
-    "Warehouse": ["warehouse", "warehouses", "facilities", "nodes"],
-    "Supplier Product": ["supplier product", "supplier_products", "supplierproduct", "suppliers"],
-    "Transport Cost": ["transport cost", "transport", "lanes", "costs"],
-    "Customers": ["customers", "customer"],
-    "Customer Product Data": ["customer product data", "demand", "customer_demand"],
-    "Mode of Transport": ["mode of transport", "modes"],
-    "Periods": ["periods", "time", "time periods"],
-    "Locations": ["locations", "location_map", "geo", "coordinates"],
+REQ = {
+    "Customers": ["Customer", "Location"],
+    "Warehouse": ["Warehouse", "Location"],
+    "Customer Product Data": ["Product", "Customer", "Location", "Period", "Demand"],
+    "Transport Cost": ["Mode of Transport", "Product", "From Location", "To Location", "Period", "Cost Per UOM"],
+    "Products": ["Product"],
+    "Supplier Product": ["Product", "Supplier", "Location", "Period", "Available"],
+    "Mode of Transport": ["Mode of Transport"],
+    "Periods": ["Start Date", "End Date"],
 }
 
-REQUIRED_COLUMNS = {
-    "Products": {"Product"},
-    "Warehouse": {"Warehouse"},
-    "Supplier Product": {"Product", "Supplier", "Location"},
-    "Transport Cost": {"Mode of Transport", "Product", "From Location", "To Location"},
-    "Customers": {"Customer"},
-    "Customer Product Data": {"Product", "Customer", "Location", "Demand"},
-    "Mode of Transport": {"Mode of Transport"},
-    "Periods": {"Start Date", "End Date"},
-    # "Locations" optional
+ALIAS_MAP = {
+    "cost per uom": "Cost Per UOM",
+    "cost per distance": "Cost per Distance",
+    "cost per trip": "Cost per Trip",
+    "minimum cost per trip": "Minimum Cost Per Trip",
+    "available (warehouse)": "Available (Warehouse)",
+    "available(warehouse)": "Available (Warehouse)",
+    "periods": "Periods",
+    "mode of transport": "Mode of Transport",
 }
 
-def _canonicalize_sheet_name(name: str) -> str:
-    n = (name or "").strip().lower()
-    for canon, aliases in CANON.items():
-        if n == canon.lower() or n in aliases:
-            return canon
-    # try simple exact title
-    for canon in CANON.keys():
-        if name.strip().lower() == canon.lower():
-            return canon
-    return name  # leave as-is; caller will decide if used
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return df
+    ren = {}
+    for c in df.columns:
+        c2 = c.strip()
+        low = c2.lower()
+        ren[c] = ALIAS_MAP.get(low, c2)
+    return df.rename(columns=ren)
 
-def _pick_canon_mapping(xl: pd.ExcelFile) -> Dict[str, str]:
-    """Return mapping canonical_name -> actual_sheetname"""
-    mapping = {}
-    for sheet in xl.sheet_names:
-        canon = _canonicalize_sheet_name(sheet)
-        # prefer the first match
-        if canon not in mapping:
-            mapping[canon] = sheet
-    return mapping
+def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    cpd = dfs.get("Customer Product Data")
+    if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+        if "Period" not in cpd.columns:
+            cpd["Period"] = DEFAULT_PERIOD
+        for col in ["Demand", "Lead Time", "Variable Cost"]:
+            if col in cpd.columns:
+                cpd[col] = pd.to_numeric(cpd[col], errors="coerce")
+        cpd["Period"] = pd.to_numeric(cpd["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
+        dfs["Customer Product Data"] = cpd
 
-def load_and_validate_excel(file) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    xl = pd.ExcelFile(file)
-    mapping = _pick_canon_mapping(xl)
+    wh = dfs.get("Warehouse")
+    if isinstance(wh, pd.DataFrame) and not wh.empty:
+        if "Available (Warehouse)" not in wh.columns:
+            wh["Available (Warehouse)"] = 1
+        for col in ["Minimum Capacity", "Maximum Capacity", "Fixed Cost", "Variable Cost", "Force Open", "Force Close", "Available (Warehouse)"]:
+            if col in wh.columns:
+                wh[col] = pd.to_numeric(wh[col], errors="coerce")
+        if "Period" in wh.columns:
+            wh["Period"] = pd.to_numeric(wh["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
+        dfs["Warehouse"] = wh
 
-    dfs: Dict[str, pd.DataFrame] = {}
+    sp = dfs.get("Supplier Product")
+    if isinstance(sp, pd.DataFrame) and not sp.empty:
+        if "Period" not in sp.columns:
+            sp["Period"] = DEFAULT_PERIOD
+        if "Available" in sp.columns:
+            sp["Available"] = pd.to_numeric(sp["Available"], errors="coerce")
+        sp["Period"] = pd.to_numeric(sp["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
+        dfs["Supplier Product"] = sp
+
+    tc = dfs.get("Transport Cost")
+    if isinstance(tc, pd.DataFrame) and not tc.empty:
+        if "Period" not in tc.columns:
+            tc["Period"] = DEFAULT_PERIOD
+        for col in ["Available", "Retrieve Distance", "Average Load Size", "Cost Per UOM", "Cost per Distance", "Cost per Trip", "Minimum Cost Per Trip"]:
+            if col in tc.columns:
+                tc[col] = pd.to_numeric(tc[col], errors="coerce")
+        tc["Period"] = pd.to_numeric(tc["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
+        dfs["Transport Cost"] = tc
+
+    return dfs
+
+def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
     report: Dict[str, Any] = {}
-    warnings: List[str] = []
+    for sheet, req_cols in REQ.items():
+        df = dfs.get(sheet)
+        if df is None:
+            report[sheet] = {"missing_columns": req_cols, "num_rows": 0, "num_columns": 0, "sheet_missing": True}
+            continue
+        missing = [c for c in req_cols if c not in df.columns]
+        report[sheet] = {
+            "missing_columns": missing,
+            "num_rows": int(df.shape[0]),
+            "num_columns": int(df.shape[1]),
+            "sheet_missing": False,
+        }
 
-    for canon, actual in mapping.items():
-        try:
-            df = xl.parse(actual)
-            # strip column names
-            df.columns = [str(c).strip() for c in df.columns]
-            dfs[canon] = df
-            report[canon] = {"num_rows": len(df), "num_columns": len(df.columns)}
-        except Exception as e:
-            warnings.append(f"Failed to load sheet '{actual}': {e}")
+    warn = []
 
-    # Ensure canonical keys exist even if not present
-    for need in CANON.keys():
-        if need not in dfs:
-            dfs[need] = pd.DataFrame()
-            report[need] = {"num_rows": 0, "num_columns": 0}
+    wh = dfs.get("Warehouse")
+    if isinstance(wh, pd.DataFrame) and "Maximum Capacity" in wh.columns:
+        neg = wh[pd.to_numeric(wh["Maximum Capacity"], errors="coerce").fillna(0) < 0]
+        if not neg.empty:
+            warn.append(f"Warehouse: {len(neg)} row(s) with negative Maximum Capacity.")
 
-    # Validation
-    for sheet, req in REQUIRED_COLUMNS.items():
-        miss = [c for c in req if c not in dfs[sheet].columns]
-        if miss:
-            report[sheet]["missing_columns"] = miss
+    cpd = dfs.get("Customer Product Data")
+    if isinstance(cpd, pd.DataFrame) and "Demand" in cpd.columns:
+        npd = cpd[pd.to_numeric(cpd["Demand"], errors="coerce").fillna(0) <= 0]
+        if not npd.empty:
+            warn.append(f"Customer Product Data: {len(npd)} row(s) with non-positive Demand.")
 
-    # normalize Period
-    if "Customer Product Data" in dfs and "Period" not in dfs["Customer Product Data"].columns:
-        dfs["Customer Product Data"]["Period"] = DEFAULT_PERIOD
+    tc = dfs.get("Transport Cost")
+    if isinstance(tc, pd.DataFrame) and not tc.empty:
+        wh_locs = set()
+        if isinstance(wh, pd.DataFrame) and not wh.empty and "Location" in wh.columns:
+            wh_locs = set(str(x) for x in wh["Location"].dropna().unique())
 
-    report["_warnings"] = warnings
+        cust_names = set()
+        custs = dfs.get("Customers")
+        if isinstance(custs, pd.DataFrame) and not custs.empty and "Customer" in custs.columns:
+            cust_names |= set(str(x) for x in custs["Customer"].dropna().unique())
+        if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+            if "Customer" in cpd.columns:
+                cust_names |= set(str(x) for x in cpd["Customer"].dropna().unique())
+            if "Location" in cpd.columns:
+                cust_names |= set(str(x) for x in cpd["Location"].dropna().unique())
+
+        orphan_from = 0
+        orphan_to = 0
+        for _, r in tc.iterrows():
+            fl = str(r.get("From Location"))
+            tl = str(r.get("To Location"))
+            if wh_locs and fl not in wh_locs:
+                orphan_from += 1
+            if cust_names and tl not in cust_names:
+                orphan_to += 1
+        if orphan_from or orphan_to:
+            warn.append(
+                f"Transport Cost: orphan lanes — From not in Warehouse.Location: {orphan_from}, "
+                f"To not in Customers/CPD: {orphan_to}"
+            )
+
+    report["_warnings"] = warn
+    return report
+
+def load_excel(file_like) -> Dict[str, pd.DataFrame]:
+    xls = pd.ExcelFile(file_like)
+    dfs: Dict[str, pd.DataFrame] = {}
+    for name in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=name)
+        df = _normalize_columns(df)
+        dfs[name] = df
+    dfs = _coerce_types(dfs)
+    return dfs
+
+def load_and_validate_excel(file_like) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    dfs = load_excel(file_like)
+    report = _validate(dfs)
     return dfs, report
-
-def build_model_index(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
-    idx: Dict[str, Any] = {}
-    products = set(dfs.get("Products", pd.DataFrame()).get("Product", pd.Series(dtype=str)).dropna().astype(str))
-    warehouses = set(dfs.get("Warehouse", pd.DataFrame()).get("Warehouse", pd.Series(dtype=str)).dropna().astype(str))
-    customers = set(dfs.get("Customers", pd.DataFrame()).get("Customer", pd.Series(dtype=str)).dropna().astype(str))
-    modes = set(dfs.get("Mode of Transport", pd.DataFrame()).get("Mode of Transport", pd.Series(dtype=str)).dropna().astype(str))
-
-    idx["products"] = sorted(products)
-    idx["warehouses"] = sorted(warehouses)
-    idx["customers"] = sorted(customers)
-    idx["modes"] = sorted(modes)
-
-    # Demand by (customer, product)
-    cpd = dfs.get("Customer Product Data", pd.DataFrame())
-    if not cpd.empty:
-        cpd_use = cpd.copy()
-        if "Period" in cpd_use.columns:
-            cpd_use = cpd_use[cpd_use["Period"].fillna(period) == period]
-        cpd_use["Demand"] = pd.to_numeric(cpd_use.get("Demand", 0), errors="coerce").fillna(0.0)
-        idx["demand_map"] = cpd_use.groupby(["Customer","Product"])["Demand"].sum().to_dict()
-    else:
-        idx["demand_map"] = {}
-
-    return idx
