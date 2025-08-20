@@ -1,940 +1,644 @@
-# --- GENIE: Supply Chain Network Designer (complete app.py) ---
-# Upload Excel → (Prompt OR Manual CRUD) → Apply → Optimize → KPIs + Maps → Q&A → Export
-# Sticky results across reruns; Ask GENIE under the map; Delta tables only when user actually edited.
+# app.py
+# GENIE — Supply Chain Network Designer (Streamlit App)
+# - Upload base-case Excel
+# - Validate sheets
+# - Visualize warehouses/customers on a map
+# - Turn NL prompts into sheet edits (Rules or Gemini)
+# - Run quick MILP optimizer and draw flows
+# - Ask GENIE (Q&A) grounded on model data
+# - Deterministic location helper (no LLM coordinates)
 
+from __future__ import annotations
 import os
-from io import BytesIO
+import io
 import json
-import hashlib
-from typing import Dict, Any, List, Tuple
+import math
+import time
+from typing import Dict, Any, List, Optional, Tuple
+
 import pandas as pd
+import numpy as np
+import streamlit as st
+import pydeck as pdk
 
+# ----------------------------- Imports from Engine -----------------------------
+missing_engine: List[str] = []
+
+# loader
 try:
-    import streamlit as st
+    from engine.loader import load_and_validate_excel, build_model_index
 except ModuleNotFoundError:
-    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt and redeploy.")
-    raise
+    load_and_validate_excel = None  # type: ignore
+    build_model_index = None  # type: ignore
+    missing_engine.append("engine/loader.py")
 
+# parser (rules)
 try:
-    import pydeck as pdk
-except Exception:
-    pdk = None
-
-st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
-
-# --- Secrets (keep API keys out of code) ---
-for block in ("openai", "gcp", "gemini"):
-    if block in st.secrets:
-        for k, v in st.secrets[block].items():
-            if isinstance(v, str):
-                os.environ[f"{block.upper()}_{k.upper()}"] = v
-if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
-    os.environ["GEMINI_API_KEY"] = st.secrets["gemini"]["api_key"]
-
-# --- Import engine modules (optional GenAI; rest required) ---
-missing = []
-try:
-    from engine.loader import load_and_validate_excel as loader
-except Exception as e:
-    st.error("❌ Could not import loader from engine/loader.py.\n" + str(e)); st.stop()
-
-try:
-    from engine.parser import parse_prompt as parse_rules
+    from engine.parser import parse_rules
 except ModuleNotFoundError:
-    missing.append("engine/parser.py (parse_prompt)"); parse_rules = None
+    parse_rules = None  # type: ignore
+    missing_engine.append("engine/parser.py (parse_rules)")
 
+# updater
 try:
-    from engine.updater import apply_scenario
+    from engine.updater import apply_scenario_edits, diff_tables
 except ModuleNotFoundError:
-    missing.append("engine/updater.py (apply_scenario)"); apply_scenario = None
+    apply_scenario_edits = None  # type: ignore
+    diff_tables = None  # type: ignore
+    missing_engine.append("engine/updater.py (apply_scenario_edits, diff_tables)")
 
+# optimizer
 try:
     from engine.optimizer import run_optimizer
 except ModuleNotFoundError:
-    missing.append("engine/optimizer.py (run_optimizer)"); run_optimizer = None
+    run_optimizer = None  # type: ignore
+    missing_engine.append("engine/optimizer.py (run_optimizer)")
 
+# geo
+try:
+    from engine.geo import build_nodes, flows_to_geo, guess_map_center, ensure_location_row
+except ModuleNotFoundError:
+    build_nodes = None  # type: ignore
+    flows_to_geo = None  # type: ignore
+    guess_map_center = None  # type: ignore
+    ensure_location_row = None  # type: ignore
+    missing_engine.append("engine/geo.py (build_nodes, flows_to_geo, guess_map_center)")
+
+# reporter (optional)
 try:
     from engine.reporter import build_summary
 except ModuleNotFoundError:
-    missing.append("engine/reporter.py (build_summary)"); build_summary = None
+    build_summary = None  # type: ignore
+    # optional; no missing message
 
+# genai
 try:
-    from engine.geo import build_nodes, flows_to_geo, guess_map_center
+    from engine.genai import parse_with_llm, answer_question, suggest_location_candidates
 except ModuleNotFoundError:
-    missing.append("engine/geo.py (build_nodes, flows_to_geo, guess_map_center)")
-    build_nodes = flows_to_geo = guess_map_center = None
+    parse_with_llm = None  # type: ignore
+    answer_question = None  # type: ignore
+    suggest_location_candidates = None  # type: ignore
+    missing_engine.append("engine/genai.py (parse_with_llm, answer_question, suggest_location_candidates)")
 
-# GenAI optional
+# For configuring Gemini if user enters a key at runtime
 try:
-    from engine.genai import parse_with_llm, summarize_scenario, answer_question
-except ModuleNotFoundError:
-    parse_with_llm = summarize_scenario = answer_question = None
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None  # type: ignore
 
-try:
-    from engine.example_gen import examples_for_file
-except ModuleNotFoundError:
-    examples_for_file = None
+# ----------------------------- Constants & Helpers -----------------------------
 
-if missing:
-    st.error("❌ Missing engine modules:\n- " + "\n- ".join(missing))
-    st.stop()
+DEFAULT_PERIOD = 2023
 
-# --- Header / Sidebar ---
-st.title("🔮 GENIE — Generative Engine for Network Intelligence & Execution")
-st.caption("Upload a base case → describe a scenario or use Manual Edits → GENIE updates sheets, optimizes, and maps your network.")
+RAW_TEMPLATE_URL = st.secrets.get(
+    "RAW_TEMPLATE_URL",
+    "https://raw.githubusercontent.com/5av1t/genie/main/sample_base-case.xlsx"
+)
 
-with st.sidebar:
-    st.header("⚙️ Settings")
-    provider = st.selectbox(
-        "Scenario Parser Provider",
-        ["Google Gemini (free tier)", "OpenAI", "Rules only (no LLM)"],
-        index=0,
-        key="cfg_provider"
-    )
-    use_llm_parser = st.checkbox("Use GenAI parser for scenarios", value=(provider != "Rules only (no LLM)"), key="cfg_use_llm")
-    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False, key="cfg_debug_compare")
-
-    st.markdown("---")
-    st.subheader("🧠 GENIE can:")
-    st.markdown(
-        "- Adjust **Demand** / **Lead Time** per Customer & Product\n"
-        "- Change **Warehouse** capacity/costs; Force Open/Close\n"
-        "- Enable/disable **Supplier Product** availability\n"
-        "- Set **Transport Cost** per lane (Mode, From, To, Product, Period)\n"
-        "- **Add / Delete** customers, warehouses, lanes, demand rows\n"
-        "- Run the **base model** (no edits)\n"
-        "- **Ask about results** (unserved customers, service %, lowest-demand customers, throughput, top flows)"
-    )
-    st.markdown("---")
-    st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local dev: `.streamlit/secrets.toml` (add gemini/api_key or openai/api_key).")
-
-# ---------------- Helpers: deltas & autoconnect ----------------
-def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, keys: list) -> pd.DataFrame:
-    if after is None or not isinstance(after, pd.DataFrame) or after.empty:
-        return pd.DataFrame(columns=keys + ["Field","Before","After","ChangeType"])
-    before = before.copy() if isinstance(before, pd.DataFrame) else pd.DataFrame(columns=keys)
-    after = after.copy()
-    common = list(set(before.columns) & set(after.columns)) if not before.empty else list(after.columns)
-    if not common: common = list(after.columns)
-    keys_used = [k for k in keys if k in common]
-    merged = after[common].merge(before[common], on=keys_used, how="left", suffixes=("_after","_before"), indicator=True)
-    fields = [c for c in common if c not in keys_used]
-    parts = []
-    for col in fields:
-        a, b = f"{col}_after", f"{col}_before"
-        if a not in merged.columns or b not in merged.columns: continue
-        diff = (merged[a] != merged[b]) | (merged[b].isna() & merged[a].notna())
-        if diff.any():
-            chunk = merged.loc[diff, keys_used + [b,a,"_merge"]].copy()
-            chunk["Field"] = col
-            chunk.rename(columns={b:"Before", a:"After"}, inplace=True)
-            chunk["ChangeType"] = chunk["_merge"].map({"left_only":"New","both":"Updated","right_only":"Removed"})
-            chunk.drop(columns=["_merge"], inplace=True)
-            parts.append(chunk)
-    if not parts: return pd.DataFrame(columns=keys_used + ["Field","Before","After","ChangeType"])
-    out = pd.concat(parts, ignore_index=True)
-    return out.sort_values(keys_used + ["Field"], kind="stable")
-
-def show_delta(title, before, after, keys):
-    st.markdown(f"#### Δ Changes — {title}")
-    d = build_delta_view(before, after, keys)
-    if d.empty: st.info(f"No visible changes detected in {title}."); return
-    st.dataframe(d, use_container_width=True)
-    added = d.loc[d["ChangeType"]=="New", keys].drop_duplicates().shape[0] if "ChangeType" in d.columns else 0
-    updated = d.loc[d["ChangeType"]=="Updated", keys].drop_duplicates().shape[0] if "ChangeType" in d.columns else 0
-    st.success(f"Applied changes: {updated} updated row(s), {added} new row(s).")
-
-def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
-    """Create placeholder lanes from every warehouse Location to every customer with positive demand, if missing."""
-    wh = dfs.get("Warehouse", pd.DataFrame())
-    cpd = dfs.get("Customer Product Data", pd.DataFrame())
-    tc  = dfs.get("Transport Cost", pd.DataFrame())
-    if not isinstance(tc, pd.DataFrame) or tc.empty:
-        tc = pd.DataFrame(columns=["Mode of Transport","Product","From Location","To Location","Period","UOM","Available","Retrieve Distance","Average Load Size","Cost Per UOM","Cost per Distance","Cost per Trip","Minimum Cost Per Trip"])
-    wlocs = {}
-    if isinstance(wh, pd.DataFrame) and not wh.empty:
-        for _, r in wh.iterrows():
-            w = str(r.get("Warehouse"))
-            loc = str(r.get("Location")) if pd.notna(r.get("Location")) else w
-            wlocs[w] = loc
-    need = set()
-    if isinstance(cpd, pd.DataFrame) and not cpd.empty:
-        use = cpd.copy()
-        if "Period" in use.columns: use = use[use["Period"] == period]
-        for _, r in use.iterrows():
-            cust = str(r.get("Customer")); prod = str(r.get("Product"))
-            try: dem = float(r.get("Demand", 0) or 0)
-            except Exception: dem = 0.0
-            if dem > 0: need.add((cust, prod))
-    existing = set()
-    if isinstance(tc, pd.DataFrame) and not tc.empty:
-        for _, r in tc.iterrows():
-            try:
-                if int(r.get("Period", period)) != period: continue
-            except Exception: continue
-            existing.add((str(r.get("From Location")), str(r.get("To Location")), str(r.get("Product"))))
-    new_rows = []
-    for _, from_loc in wlocs.items():
-        for (to_cust, prod) in need:
-            key = (str(from_loc), str(to_cust), str(prod))
-            if key in existing: continue
-            new_rows.append({
-                "Mode of Transport":"Secondary Delivery LTL","Product":prod,"From Location":from_loc,"To Location":to_cust,"Period":period,
-                "UOM":"Each","Available":1,"Retrieve Distance":0.0,"Average Load Size":1.0,"Cost Per UOM":float(default_cost),
-                "Cost per Distance":0.0,"Cost per Trip":0.0,"Minimum Cost Per Trip":0.0
-            })
-    if new_rows:
-        tc = pd.concat([tc, pd.DataFrame(new_rows)], ignore_index=True)
-    dfs["Transport Cost"] = tc
-    return dfs, len(new_rows)
-
-# ---------- Grounded QA helpers (no hallucinations) ----------
-def _served_by_customer(diag: Dict[str, Any]) -> Dict[str, float]:
-    served = {}
-    flows = (diag or {}).get("flows", [])
-    if not isinstance(flows, list):
-        return served
-    for f in flows:
-        c = str(f.get("customer"))
-        q = float(f.get("qty", 0) or 0)
-        served[c] = served.get(c, 0.0) + q
-    return served
-
-def _demand_by_customer(dfs: Dict[str, pd.DataFrame], period: int = 2023) -> Dict[str, float]:
-    cpd = dfs.get("Customer Product Data", pd.DataFrame())
-    out = {}
-    if isinstance(cpd, pd.DataFrame) and not cpd.empty:
-        df = cpd.copy()
-        if "Period" in df.columns:
-            df = df[df["Period"] == period]
-        for _, r in df.iterrows():
-            cust = str(r.get("Customer"))
-            q = float(r.get("Demand", 0) or 0)
-            out[cust] = out.get(cust, 0.0) + q
-    return out
-
-def _unserved_customers(dfs: Dict[str, pd.DataFrame], diag: Dict[str, Any], period: int = 2023) -> Tuple[int, List[Tuple[str, float]]]:
-    dem = _demand_by_customer(dfs, period)
-    srv = _served_by_customer(diag)
-    unserved_list = []
-    for c, d in dem.items():
-        s = srv.get(c, 0.0)
-        if d > 0 and s < d - 1e-9:
-            unserved_list.append((c, d - s))
-    unserved_list.sort(key=lambda x: (-x[1], x[0]))
-    return len(unserved_list), unserved_list
-
-def grounded_answer(q: str, dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
-    qs = (q or "").strip().lower()
-    # unserved customers
-    if any(t in qs for t in ["unserved", "not served", "not-served", "unmet"]):
-        cnt, lst = _unserved_customers(dfs, diag, period)
-        preview = ", ".join([f"{c}({int(u)})" for c, u in lst[:10]]) if lst else "—"
-        return f"{cnt} customer(s) have unmet demand. Top gaps: {preview}"
-    # least/lowest demand
-    if any(t in qs for t in ["least demand", "lowest demand", "smallest demand"]):
-        dem = _demand_by_customer(dfs, period)
-        if not dem: return "No demand found for the selected period."
-        items = [(c, v) for c, v in dem.items() if v > 0]
-        if not items: return "All customers have zero demand."
-        items.sort(key=lambda x: (x[1], x[0]))
-        top = ", ".join([f"{c}({int(v)})" for c, v in items[:10]])
-        return f"Lowest-demand customers: {top}"
-    # service level
-    if "service level" in qs or ("service" in qs and "%" in qs):
-        svc = kpis.get("service_pct")
-        total = kpis.get("total_demand")
-        served = kpis.get("served")
-        if svc is None:
-            if total and total > 0:
-                svc = round(100.0 * float(served or 0) / float(total), 2)
-            else:
-                svc = 0.0
-        return f"Service level: {svc}% (served {int(served or 0)} of {int(total or 0)})."
-    # top flows/lanes
-    if any(t in qs for t in ["top flows", "top lanes", "largest flows"]):
-        flows = (diag or {}).get("flows", [])
-        if not flows: return "No flows available."
-        rows = sorted([(f.get("warehouse"), f.get("customer"), f.get("product"), float(f.get("qty", 0) or 0)) for f in flows],
-                      key=lambda x: -x[3])[:10]
-        txt = "; ".join([f"{w}→{c} {p}:{int(q)}" for w,c,p,q in rows])
-        return f"Top flows: {txt}"
-    # lowest throughput warehouses
-    if any(t in qs for t in ["lowest throughput", "least throughput", "lowest outbound"]):
-        flows = (diag or {}).get("flows", [])
-        tot_by_w = {}
-        for f in flows:
-            tot_by_w[f.get("warehouse")] = tot_by_w.get(f.get("warehouse"), 0.0) + float(f.get("qty", 0) or 0)
-        if not tot_by_w: return "No flows available to compute throughput."
-        rows = sorted(tot_by_w.items(), key=lambda x: (x[1], str(x[0])))[:5]
-        txt = ", ".join([f"{w}:{int(v)}" for w,v in rows])
-        return f"Lowest outbound throughput warehouses: {txt}"
-    return ""  # unknown → caller may escalate to LLM
-
-def build_llm_context(dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
-    dem = _demand_by_customer(dfs, period)
-    _, unserved_list = _unserved_customers(dfs, diag, period)
-    least = sorted([(c, v) for c, v in dem.items()], key=lambda x: (x[1], x[0]))[:20]
-    def fmt_rows(rows): return "\n".join([f"- {c}: {int(v)}" for c, v in rows]) if rows else "- (none)"
-    cpd = dfs.get("Customer Product Data", pd.DataFrame())
-    prods = []
-    if isinstance(cpd, pd.DataFrame) and "Product" in cpd.columns:
-        prods = sorted(set(cpd["Product"].dropna().astype(str).tolist()))
-    lines = [
-        f"Period: {period}",
-        f"KPIs: status={kpis.get('status')}, total_demand={int(kpis.get('total_demand') or 0)}, served={int(kpis.get('served') or 0)}, service_pct={kpis.get('service_pct')}",
-        "Least-demand customers (up to 20):",
-        fmt_rows(least),
-        "Unserved customers (up to 20):",
-        fmt_rows(unserved_list[:20]),
-        f"Products: {', '.join(prods[:20])}" + ("" if len(prods) <= 20 else ", ..."),
-    ]
-    return "\n".join(lines)
-
-# ------------- Suggested prompts -------------
-STATIC_EXAMPLES = [
-    "run the base model",
-    "Increase demand at a specific customer by 10% and set lead time to 8",
-    "Cap a warehouse Maximum Capacity at 25000; force close another warehouse",
-    "Set a lane cost per uom to 9.5 for a chosen mode/from/to/product in 2023",
-    "Add a new customer with demand and lead time",
-    "Add a new warehouse at a city; force open; set capacity",
-    "Delete a specific transport lane in 2023",
+PALETTE = [
+    [52, 152, 219],  # blue
+    [46, 204, 113],  # green
+    [231, 76, 60],   # red
+    [155, 89, 182],  # purple
+    [241, 196, 15],  # yellow
+    [230, 126, 34],  # orange
+    [26, 188, 156],  # teal
+    [149, 165, 166], # gray
+    [52, 73, 94],    # dark
+    [39, 174, 96],   # dark green
 ]
 
-# Prefill buffer for prompt
-user_prompt_default = st.session_state.get("user_prompt","")
-if "prefill_prompt" in st.session_state:
-    user_prompt_default = st.session_state.pop("prefill_prompt", user_prompt_default)
+def _product_color_map(products: List[str]) -> Dict[str, List[int]]:
+    mp: Dict[str, List[int]] = {}
+    for i, p in enumerate(products):
+        mp[p] = PALETTE[i % len(PALETTE)]
+    if not mp:
+        mp["(default)"] = [52, 152, 219]
+    return mp
 
-# ---------------- Results renderer (sticky across reruns) ----------------
-def render_results(dfs: Dict[str, pd.DataFrame],
-                   kpis: Dict[str, Any],
-                   diag: Dict[str, Any],
-                   period: int,
-                   scenario: Dict[str, Any] = None,
-                   user_prompt: str = "",
-                   before_after: Dict[str, Dict[str, pd.DataFrame]] = None):
-    """Render KPIs → Diagnostics → Map → Ask GENIE → Preview/Delta → Export; survives widget reruns."""
-    # KPIs & Summary
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("📊 KPIs"); st.write(kpis)
-    with c2:
-        st.subheader("📝 Executive Summary")
-        if build_summary:
-            st.markdown(build_summary(user_prompt or "", scenario or {}, kpis, diag))
-        else:
-            st.info("reporter.build_summary missing.")
+def _prep_node_layers(nodes_df: pd.DataFrame) -> List[pdk.Layer]:
+    """Scatterplot for warehouses and customers."""
+    layers = []
+    if not isinstance(nodes_df, pd.DataFrame) or nodes_df.empty:
+        return layers
+    # warehouses
+    wh = nodes_df[nodes_df["type"] == "warehouse"]
+    if not wh.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=wh,
+            get_position=["lon", "lat"],
+            get_radius=20000,
+            radius_min_pixels=4,
+            radius_max_pixels=10,
+            get_fill_color=[255, 140, 0],  # orange
+            pickable=True,
+        ))
+    # customers
+    cu = nodes_df[nodes_df["type"] == "customer"]
+    if not cu.empty:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=cu,
+            get_position=["lon", "lat"],
+            get_radius=15000,
+            radius_min_pixels=3,
+            radius_max_pixels=8,
+            get_fill_color=[0, 122, 255],  # blue
+            pickable=True,
+        ))
+    return layers
 
-    # Diagnostics
-    st.subheader("🧪 Flow Diagnostics")
-    try:
-        tc = dfs.get("Transport Cost", pd.DataFrame())
-        lanes_period = 0
-        if isinstance(tc, pd.DataFrame) and not tc.empty:
-            tcf = tc.copy()
-            try: tcf = tcf[tcf["Period"] == period]
-            except Exception: pass
-            if "Available" in tcf.columns: tcf = tcf[tcf["Available"].fillna(1) != 0]
-            if "Cost Per UOM" in tcf.columns: tcf = tcf[pd.to_numeric(tcf["Cost Per UOM"], errors="coerce").fillna(0) >= 0]
-            lanes_period = len(tcf)
-        arcs_considered = (diag or {}).get("num_arcs", None)
-        flows = (diag or {}).get("flows", [])
-        flows_count = len(flows) if isinstance(flows, list) else 0
-        geocoded = 0
-        arcs_df = pd.DataFrame()
-        if flows_to_geo and isinstance(flows, list):
-            try:
-                arcs_df = flows_to_geo(flows, dfs); geocoded = len(arcs_df) if isinstance(arcs_df, pd.DataFrame) else 0
-            except Exception: geocoded = 0
-        st.write({"period": period, "lanes_in_transport_cost": lanes_period, "optimizer_arcs_considered": arcs_considered, "flows_returned": flows_count, "flows_geocoded_for_map": geocoded})
-        if (kpis or {}).get("status") in {"no_feasible_arcs","no_demand","no_positive_demand"}:
-            st.warning("No flows because the optimizer couldn't route demand. Check lanes, demand > 0, and warehouse capacity/availability.")
-        elif flows_count > 0 and geocoded == 0:
-            st.warning("Flows exist but none were plotted. Add a 'Locations' sheet with `Location, Latitude, Longitude` for Warehouse.Location and Customer names.")
-    except Exception as e:
-        st.info(f"Diagnostics unavailable: {e}")
+def _prep_flow_layer(arcs_df: pd.DataFrame, color_by_product=True) -> Optional[pdk.Layer]:
+    """Thin line flows; color by product; width ~ qty."""
+    if not isinstance(arcs_df, pd.DataFrame) or arcs_df.empty:
+        return None
 
-    # Map with flows (thin + color by product + legend)
-    st.subheader("🌍 Network Map (With Flows)")
-    if pdk and build_nodes and flows_to_geo and guess_map_center:
-        try:
-            nodes_df = build_nodes(dfs)
-            flow_list = (diag or {}).get("flows", [])
-            arcs_df = flows_to_geo(flow_list, dfs)
-
-            if nodes_df.empty:
-                st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
-            else:
-                lat0, lon0 = guess_map_center(nodes_df)
-                wh = nodes_df[nodes_df["type"]=="warehouse"]; cu = nodes_df[nodes_df["type"]=="customer"]
-                layers=[]
-                if not wh.empty:
-                    layers.append(
-                        pdk.Layer("ScatterplotLayer", data=wh, get_position='[lon, lat]', get_radius=45000,
-                                  pickable=True, filled=True, get_fill_color=[30,136,229])
-                    )
-                if not cu.empty:
-                    layers.append(
-                        pdk.Layer("ScatterplotLayer", data=cu, get_position='[lon, lat]', get_radius=30000,
-                                  pickable=True, filled=True, get_fill_color=[76,175,80])
-                    )
-
-                if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
-                    arcs_df = arcs_df[arcs_df["qty"] > 1e-9].copy()
-                    if not arcs_df.empty:
-                        qmax = float(arcs_df["qty"].max())
-                        arcs_df["width"] = 1.0 if qmax <= 0 else (1.0 + 5.0 * (arcs_df["qty"] / qmax).clip(0, 1))
-
-                        base_palette = [
-                            (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48), (145, 30, 180),
-                            (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 190), (0, 128, 128),
-                        ]
-                        prod_colors = {}
-                        def color_for(prod: str):
-                            if prod in prod_colors: return prod_colors[prod]
-                            if len(prod_colors) < len(base_palette):
-                                prod_colors[prod] = base_palette[len(prod_colors)]
-                            else:
-                                import colorsys
-                                h = abs(hash(prod)) % 360
-                                r, g, b = colorsys.hsv_to_rgb(h/360.0, 0.7, 1.0)
-                                prod_colors[prod] = (int(r*255), int(g*255), int(b*255))
-                            return prod_colors[prod]
-
-                        arcs_df["rgb"] = arcs_df["product"].fillna("Unknown").map(color_for)
-                        arcs_df["color"] = arcs_df["rgb"].apply(lambda t: [int(t[0]), int(t[1]), int(t[2])])
-
-                        layers.append(
-                            pdk.Layer(
-                                "ArcLayer",
-                                data=arcs_df,
-                                get_source_position='[from_lon, from_lat]',
-                                get_target_position='[to_lon, to_lat]',
-                                get_width='width',
-                                get_source_color='color',
-                                get_target_color='color',
-                                pickable=True,
-                            )
-                        )
-
-                deck = pdk.Deck(
-                    initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.3),
-                    layers=layers,
-                    tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/><i>{product}</i>: {qty}", "style":{"color":"white"}},
-                    map_style="dark",
-                )
-                st.pydeck_chart(deck)
-
-                # Legend
-                try:
-                    if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
-                        legend_rows = (
-                            arcs_df[["product", "color"]]
-                            .drop_duplicates()
-                            .sort_values("product")
-                            .values.tolist()
-                        )
-                        if legend_rows:
-                            html = "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
-                            for prod, col in legend_rows:
-                                r, g, b = col
-                                html += (
-                                    "<div style='display:flex;align-items:center;gap:6px; margin:2px 6px;'>"
-                                    f"<span style='display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:2px;'></span>"
-                                    f"<span style='font-size:12px;'>{prod}</span></div>"
-                                )
-                            html += "</div>"
-                            st.markdown(html, unsafe_allow_html=True)
-                except Exception:
-                    pass
-
-                if (diag or {}).get("flows", []) and (arcs_df is None or arcs_df.empty):
-                    st.warning("Flows exist but none were plotted. Ensure warehouse/customer names resolve to coordinates (Locations sheet or known city names).")
-        except Exception as e:
-            st.warning(f"Map rendering skipped: {e}")
+    df = arcs_df.copy()
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0.0)
+    q = df["qty"].clip(lower=0)
+    if q.max() <= 0:
+        width = np.full(len(df), 1.0)
     else:
-        st.info("pydeck not available or geo module missing; skipping map.")
+        q95 = np.quantile(q, 0.95)
+        q95 = q95 if q95 > 0 else q.max()
+        width = 0.6 + 3.4 * (q / (q95 + 1e-9))  # 0.6..4.0 px
+    df["width"] = width
 
-    # ---- Ask GENIE (immediately under map) ----
-    st.subheader("💬 Ask GENIE about results")
-    qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
-    with st.form("qa_form", clear_on_submit=False):
-        q = st.text_input("Ask things like: 'Which warehouse has the lowest throughput?' 'How many customers are unserved?' 'Lowest-demand customers?'", key="qa_text")
-        submit_qa = st.form_submit_button("Ask")
-    if submit_qa:
-        # Always try grounded first for known intents
-        ans = grounded_answer(q, dfs, kpis, diag, period=period)
+    if color_by_product:
+        prods = sorted([str(x) for x in df["product"].dropna().unique().tolist()])
+        cmap = _product_color_map(prods)
+        df["color"] = df["product"].apply(lambda p: cmap.get(str(p), [52, 152, 219]))
+    else:
+        df["color"] = [52, 152, 219]  # single color
 
-        # If LLM selected or not recognized, escalate with bounded context
-        use_llm = (qa_mode.startswith("Gemini") or qa_mode.startswith("OpenAI")) and (answer_question is not None)
-        if (not ans) and use_llm:
-            context = build_llm_context(dfs, kpis, diag, period=period)
-            prov = "gemini" if qa_mode.startswith("Gemini") else "openai"
-            q2 = f"Use ONLY this context to answer:\n{context}\n\nQuestion: {q}\nAnswer briefly and numerically when possible."
-            try:
-                ans = answer_question(q2, kpis, diag, provider=prov, dfs=dfs, force_llm=True)
-            except Exception as e:
-                ans = f"(LLM error; fallback) {grounded_answer(q, dfs, kpis, diag, period=period) or 'Sorry, I could not answer that.'}"
-        if not ans:
-            ans = "Sorry, I couldn't interpret that. Try asking about service %, unserved customers, lowest-demand customers, top flows, or lowest throughput warehouses."
-        st.markdown(f"**Answer**: {ans}")
+    return pdk.Layer(
+        "LineLayer",
+        data=df,
+        get_source_position=["from_lon", "from_lat"],
+        get_target_position=["to_lon", "to_lat"],
+        get_width="width",
+        get_color="color",
+        pickable=True,
+        auto_highlight=True,
+    )
 
-    # ---- Before/After preview + Delta (only when user actually edited) ----
-    if before_after:
-        # Quick preview
-        st.subheader("📋 Before vs After (Quick Preview)")
-        b = before_after.get("before", {})
-        a = before_after.get("after", {})
-        tabs = st.tabs(["Customers","Customer Product Data","Warehouse","Supplier Product","Transport Cost"])
-        with tabs[0]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b.get("Customers", pd.DataFrame()).head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a.get("Customers", pd.DataFrame()).head(25), use_container_width=True)
-        with tabs[1]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b.get("Customer Product Data", pd.DataFrame()).head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a.get("Customer Product Data", pd.DataFrame()).head(25), use_container_width=True)
-        with tabs[2]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b.get("Warehouse", pd.DataFrame()).head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a.get("Warehouse", pd.DataFrame()).head(25), use_container_width=True)
-        with tabs[3]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b.get("Supplier Product", pd.DataFrame()).head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a.get("Supplier Product", pd.DataFrame()).head(25), use_container_width=True)
-        with tabs[4]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b.get("Transport Cost", pd.DataFrame()).head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a.get("Transport Cost", pd.DataFrame()).head(25), use_container_width=True)
+def _safe_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-        # Delta tables shown only if user made edits (base model → skip)
-        user_change_count = before_after.get("user_change_count", 0)
-        if user_change_count > 0:
-            st.subheader("Δ Delta Views (Changes Only)")
-            show_delta("Customers", b.get("Customers", pd.DataFrame()), a.get("Customers", pd.DataFrame()), ["Customer","Location"])
-            show_delta("Customer Product Data", b.get("Customer Product Data", pd.DataFrame()), a.get("Customer Product Data", pd.DataFrame()), ["Product","Customer","Location","Period"])
-            bw, aw = b.get("Warehouse", pd.DataFrame()), a.get("Warehouse", pd.DataFrame())
-            if isinstance(aw, pd.DataFrame) and not aw.empty:
-                wh_keys = ["Warehouse"] + (["Period"] if "Period" in aw.columns and "Period" in bw.columns else [])
-                show_delta("Warehouse", bw, aw, wh_keys)
-            show_delta("Supplier Product", b.get("Supplier Product", pd.DataFrame()), a.get("Supplier Product", pd.DataFrame()), ["Product","Supplier","Location","Period"])
-            show_delta("Transport Cost", b.get("Transport Cost", pd.DataFrame()), a.get("Transport Cost", pd.DataFrame()), ["Mode of Transport","Product","From Location","To Location","Period"])
-        else:
-            st.info("No user edits detected (base model). Skipping delta tables.")
-
-    # Export current scenario sheets
-    st.subheader("💾 Export")
+def _download_bytesio_from_url(url: str) -> Optional[bytes]:
     try:
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            for name, df in dfs.items():
-                if isinstance(df, pd.DataFrame):
-                    sname = str(name)[:31] or "Sheet"
-                    df.to_excel(w, sheet_name=sname, index=False)
-        st.download_button(
-            "Download Updated Scenario Excel",
-            data=buf.getvalue(),
-            file_name="genie_updated_scenario.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    except Exception as e:
-        st.warning(f"Creating the Excel download failed: {e}")
-
-# ----------------------- Main page flow -----------------------
-uploaded = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
-
-if uploaded:
-    # Load + validate
-    try:
-        dfs, report = loader(uploaded)
-    except Exception as e:
-        st.error(f"❌ Error reading Excel: {e}"); st.stop()
-
-    with st.expander("✅ Sheet Validation Report"):
-        try:
-            for sheet, rep in report.items():
-                if sheet == "_warnings": continue
-                if not isinstance(rep, dict): continue
-                miss = rep.get("missing_columns", [])
-                if miss: st.error(f"{sheet}: Missing columns - {miss}")
-                else:    st.success(f"{sheet}: OK ({rep.get('num_rows',0)} rows, {rep.get('num_columns',0)} columns)")
-            if isinstance(report.get("_warnings", []), list) and report["_warnings"]:
-                st.warning("General warnings:")
-                for w in report["_warnings"]: st.write(f"• {w}")
-        except Exception as e:
-            st.warning(f"Validation display issue: {e}")
-
-    st.success("Base case loaded successfully.")
-
-    # Suggested prompts ABOVE the prompt box
-    st.subheader("💡 Suggested prompts")
-    try:
-        fp = hashlib.sha1("|".join(sorted([f"{k}:{v.shape[0]}x{v.shape[1]}" for k, v in dfs.items() if isinstance(v, pd.DataFrame)])).encode()).hexdigest()
+        import requests
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.content
     except Exception:
-        fp = "nofp"
-    if "examples_cache" not in st.session_state: st.session_state["examples_cache"] = {}
-    dyn = st.session_state["examples_cache"].get(fp)
-    if dyn is None:
-        try:
-            dyn = examples_for_file(dfs, provider="gemini") if examples_for_file else []
-        except Exception:
-            dyn = []
-        st.session_state["examples_cache"][fp] = dyn
+        return None
+    return None
 
-    with st.expander("Show suggestions"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Static**")
-            for ex in STATIC_EXAMPLES: st.code(ex, language="text")
-            pick1 = st.selectbox("Insert static example:", ["(choose)"] + STATIC_EXAMPLES, key="pick_static")
-            if st.button("Insert static"):
-                if pick1 != "(choose)":
-                    st.session_state["prefill_prompt"] = pick1; st.rerun()
-        with c2:
-            st.markdown("**From your file**")
-            if dyn:
-                for ex in dyn: st.code(ex, language="text")
-                pick2 = st.selectbox("Insert generated example:", ["(choose)"] + dyn, key="pick_dyn")
-                if st.button("Insert generated"):
-                    if pick2 != "(choose)":
-                        st.session_state["prefill_prompt"] = pick2; st.rerun()
-            else:
-                st.info("Upload contains limited metadata; static examples only.")
+def _has_diffs(diffs: Dict[str, pd.DataFrame]) -> bool:
+    if not isinstance(diffs, dict):
+        return False
+    for v in diffs.values():
+        if isinstance(v, pd.DataFrame) and not v.empty:
+            return True
+    return False
 
-    # Map of nodes (on upload)
-    st.subheader("🌍 Network Map (Nodes)")
-    if pdk and build_nodes and guess_map_center:
+def _scenario_bullets(scn: Dict[str, Any]) -> List[str]:
+    bullets = []
+    if not scn:
+        return ["No edits (base model)."]
+    p = scn.get("period", DEFAULT_PERIOD)
+    if scn.get("demand_updates"): bullets.append(f"Demand updates: {len(scn['demand_updates'])} row(s) in {p}.")
+    if scn.get("warehouse_changes"): bullets.append(f"Warehouse changes: {len(scn['warehouse_changes'])}.")
+    if scn.get("supplier_changes"): bullets.append(f"Supplier changes: {len(scn['supplier_changes'])}.")
+    if scn.get("transport_updates"): bullets.append(f"Transport updates: {len(scn['transport_updates'])}.")
+    if scn.get("adds"): bullets.append(f"Adds: {sum(len(v) for v in scn['adds'].values())} row(s).")
+    if scn.get("deletes"): bullets.append(f"Deletes: {sum(len(v) for v in scn['deletes'].values())} row(s).")
+    return bullets or [f"No edits for period {p}."]
+
+# ----------------------------- Streamlit Page Config -----------------------------
+
+st.set_page_config(page_title="GENIE — Supply Chain Network Designer", layout="wide", page_icon="🧞")
+
+# Initialize session defaults BEFORE widgets
+for k, v in {
+    "uploaded_name": None,
+    "dfs": None,
+    "report": None,
+    "model_index": None,
+    "last_updated_dfs": None,
+    "last_scenario": {},
+    "kpis": {},
+    "diag": {},
+    "flows_geo": pd.DataFrame(),
+    "user_prompt": "",
+    "llm_provider": "None",
+    "gemini_key_set": False,
+    "qa_answer": "",
+    "color_by_product": True,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ----------------------------- Sidebar -----------------------------
+
+st.sidebar.title("🧞 GENIE")
+st.sidebar.caption("Hackathon-ready GenAI network designer")
+
+# Template download
+st.sidebar.markdown("**Get a template**")
+c1, c2 = st.sidebar.columns([1,1])
+with c1:
+    if st.button("Download template"):
+        raw = _download_bytesio_from_url(RAW_TEMPLATE_URL)
+        if raw:
+            st.download_button("Save Excel", data=raw, file_name="sample_base-case.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.sidebar.warning("Unable to fetch template. Verify RAW_TEMPLATE_URL.")
+
+with c2:
+    st.sidebar.markdown("[View repo](https://github.com/5av1t/genie)")
+
+# Provider selection (does NOT clear state)
+st.sidebar.markdown("---")
+st.sidebar.markdown("**GenAI provider**")
+prov = st.sidebar.radio("Choose", ["None (grounded only)", "Google Gemini", "OpenAI"], index={"None (grounded only)":0,"Google Gemini":1,"OpenAI":2}[st.session_state["llm_provider"] if st.session_state["llm_provider"] in ("None (grounded only)","Google Gemini","OpenAI") else "None (grounded only)"], key="llm_provider")
+
+# API key field (password), updates env and config in-place
+if prov == "Google Gemini":
+    st.sidebar.write("Set **GEMINI_API_KEY** (stored only for this session):")
+    gem_key = st.sidebar.text_input("GEMINI_API_KEY", type="password")
+    if gem_key and genai is not None:
+        os.environ["GEMINI_API_KEY"] = gem_key
         try:
-            nodes = build_nodes(dfs)
-            if nodes.empty:
-                st.info("No geocoded nodes. Add a 'Locations' sheet with Location, Latitude, Longitude or use city-like names.")
-            else:
-                lat0, lon0 = guess_map_center(nodes)
-                wh = nodes[nodes["type"]=="warehouse"]; cu = nodes[nodes["type"]=="customer"]
-                layers=[]
-                if not wh.empty:
-                    layers.append(pdk.Layer("ScatterplotLayer", data=wh, get_position='[lon, lat]', get_radius=60000, pickable=True, filled=True, get_fill_color=[30,136,229]))
-                if not cu.empty:
-                    layers.append(pdk.Layer("ScatterplotLayer", data=cu, get_position='[lon, lat]', get_radius=40000, pickable=True, filled=True, get_fill_color=[76,175,80]))
-                deck=pdk.Deck(initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2), layers=layers, tooltip={"html":"<b>{name}</b><br/>{location}","style":{"color":"white"}})
-                st.pydeck_chart(deck)
+            genai.configure(api_key=gem_key)
+            st.session_state["gemini_key_set"] = True
+            st.sidebar.success("Gemini configured.")
         except Exception as e:
-            st.warning(f"Map rendering skipped: {e}")
-    else:
-        st.info("pydeck not available or geo module missing; skipping map.")
+            st.sidebar.error(f"Gemini config failed: {e}")
+elif prov == "OpenAI":
+    st.sidebar.write("Set **OPENAI_API_KEY** in your Streamlit secrets or environment.")
+    # openai lib picks key from env; we don't reconfigure here.
 
+# Use cases
+st.sidebar.markdown("---")
+st.sidebar.subheader("What can GENIE do?")
+st.sidebar.markdown(
+"""
+- Diagnose infeasibility and propose **concrete fixes**.
+- Replace/relocate a warehouse and **clone lanes**.
+- Reach a **service target** (e.g., 98%) with minimal edits.
+- Add/enable **suppliers/lanes** and re-run.
+- Explain **unserved customers** with reasons.
+"""
+)
+
+# ----------------------------- Main Layout -----------------------------
+
+st.title("🧞 GENIE — Supply Chain Network Designer")
+st.caption("Upload your base-case Excel, create what‑if scenarios in plain English, optimize, and visualize flows.")
+
+if missing_engine:
+    with st.expander("⚠️ Missing engine modules"):
+        for m in missing_engine:
+            st.warning(m)
+
+# Upload
+uploaded = st.file_uploader("Upload your base-case Excel (.xlsx)", type=["xlsx"], key="uploader")
+if uploaded:
+    st.session_state["uploaded_name"] = uploaded.name
+
+# Load + Validate
+if uploaded and load_and_validate_excel is not None:
+    try:
+        dfs, report = load_and_validate_excel(uploaded)
+        st.session_state["dfs"] = dfs
+        st.session_state["report"] = report
+        if build_model_index is not None:
+            st.session_state["model_index"] = build_model_index(dfs, period=DEFAULT_PERIOD)
+        st.success(f"Loaded: {st.session_state['uploaded_name']}")
+    except Exception as e:
+        st.error(f"Failed to read Excel: {e}")
+
+# Validation summary
+if st.session_state["report"]:
+    with st.expander("✅ Sheet Validation Report", expanded=True):
+        rep = st.session_state["report"]
+        if isinstance(rep, dict):
+            for sheet, info in rep.items():
+                if sheet == "_warnings":
+                    continue
+                if isinstance(info, dict):
+                    miss = info.get("missing_columns", [])
+                    rows = info.get("num_rows", 0)
+                    cols = info.get("num_columns", 0)
+                    if miss:
+                        st.error(f"{sheet}: Missing columns - {miss}")
+                    else:
+                        st.success(f"{sheet}: OK ({rows} rows, {cols} columns)")
+            # warnings
+            warns = rep.get("_warnings", [])
+            if warns:
+                st.info("Warnings:")
+                for w in warns:
+                    st.write(f"• {w}")
+        else:
+            st.write(rep)
+
+# ----------------------------- Base Map (after upload) -----------------------------
+
+if st.session_state["dfs"] and build_nodes is not None and guess_map_center is not None:
+    nodes = build_nodes(st.session_state["dfs"])
+    if nodes is not None and not nodes.empty:
+        st.subheader("Network Map — Nodes")
+        center_lat, center_lon = guess_map_center(nodes, default=(30.0, 15.0))
+        view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=3.7)
+        layers = _prep_node_layers(nodes)
+        st.pydeck_chart(pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view, layers=layers, tooltip={"text": "{name}\n{type}\n{location}"}))
+    else:
+        st.info("No nodes could be resolved. Add 'Locations' with Latitude/Longitude or use the Location helper below.")
+
+# ----------------------------- Scenario Input (Rules + LLM side-by-side) -----------------------------
+
+if st.session_state["dfs"]:
     st.markdown("---")
+    st.header("Scenario Builder")
 
-    # ---------------- Manual Edits (CRUD) ----------------
-    st.subheader("🛠️ Manual Edits (point‑and‑click)")
-    with st.expander("Open Manual Edits"):
-        # Pull values for selects
-        products  = sorted(dfs.get("Customer Product Data", pd.DataFrame()).get("Product", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
-        customers = sorted(dfs.get("Customers", pd.DataFrame()).get("Customer", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
-        locations_c = sorted(dfs.get("Customers", pd.DataFrame()).get("Location", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
-        warehouses = sorted(dfs.get("Warehouse", pd.DataFrame()).get("Warehouse", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
-        locations_w = sorted(dfs.get("Warehouse", pd.DataFrame()).get("Location", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
-        modes      = sorted(dfs.get("Transport Cost", pd.DataFrame()).get("Mode of Transport", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+    # Dynamic examples based on current data (lightweight)
+    dyn_examples: List[str] = []
+    idx = st.session_state.get("model_index") or {}
+    products = idx.get("products", [])
+    warehouses = sorted((st.session_state["dfs"].get("Warehouse") or pd.DataFrame()).get("Warehouse", pd.Series([])).astype(str).tolist()) if isinstance(st.session_state["dfs"].get("Warehouse"), pd.DataFrame) else []
+    customers = sorted((st.session_state["dfs"].get("Customers") or pd.DataFrame()).get("Customer", pd.Series([])).astype(str).tolist()) if isinstance(st.session_state["dfs"].get("Customers"), pd.DataFrame) else []
+    if products and customers:
+        dyn_examples.append(f"Increase {products[0]} demand at {customers[0]} by 10% and set Lead Time to 8 days")
+    if warehouses:
+        dyn_examples.append(f"Cap {warehouses[0]} Maximum Capacity at 25000; force close {warehouses[-1]}")
+    if products and warehouses:
+        dyn_examples.append(f"Enable {products[-1]} at Antalya_FG")
+        if customers:
+            dyn_examples.append(f"Set Secondary Delivery LTL lane {warehouses[0]} → {customers[0]} for {products[0]} to Cost Per UOM = 9.5")
 
-        tabs_crud = st.tabs(["Demand update","Add customer","Add/Update warehouse","Add/Update lane","Delete"])
-
-        # Demand update
-        with tabs_crud[0]:
-            st.caption("Update demand for a given Product × Customer × (Location=Customer by default)")
-            p = st.selectbox("Product", products, key="crud_dem_p") if products else st.text_input("Product (type exact)", key="crud_dem_p_txt")
-            c = st.selectbox("Customer", customers, key="crud_dem_c") if customers else st.text_input("Customer (type exact)", key="crud_dem_c_txt")
-            loc = st.text_input("Location (defaults to Customer)", value="", key="crud_dem_loc")
-            col1, col2 = st.columns(2)
-            with col1:
-                delta = st.number_input("Δ% (apply percent change, optional)", value=0.0, step=1.0, format="%.2f")
-            with col2:
-                set_abs = st.number_input("Set absolute Demand (overrides Δ%, optional)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-            lt = st.number_input("Set Lead Time (optional)", min_value=0, value=0, step=1)
-            if st.button("➕ Queue demand update"):
-                loc_final = (loc.strip() or (c if isinstance(c, str) else ""))
-                ed = {"product": str(p), "customer": str(c), "location": str(loc_final)}
-                if set_abs > 0:
-                    ed["set"] = {"Demand": float(set_abs)}
-                elif abs(delta) > 0:
-                    ed["delta_pct"] = float(delta)
-                if lt > 0:
-                    ed.setdefault("set", {})["Lead Time"] = int(lt)
-                st.session_state.setdefault("manual_scenario", {"period": 2023})
-                st.session_state["manual_scenario"].setdefault("demand_updates", []).append(ed)
-                st.success(f"Queued: {ed}")
-
-        # Add customer
-        with tabs_crud[1]:
-            st.caption("Create customer and (optionally) its demand row.")
-            nc = st.text_input("New Customer name", key="crud_addcust_name")
-            nloc = st.text_input("Location (defaults to same name)", key="crud_addcust_loc")
-            ap = st.selectbox("Product for initial demand (optional)", ["(none)"] + products, key="crud_addcust_prod")
-            ad = st.number_input("Initial Demand (optional)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-            alt = st.number_input("Lead Time (optional)", min_value=0, value=0, step=1)
-            if st.button("➕ Queue customer add"):
-                loc_final = nloc.strip() or nc.strip()
-                scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
-                scn.setdefault("adds", {}).setdefault("Customers", []).append({"Customer": nc.strip(), "Location": loc_final})
-                if ap != "(none)" and ad > 0:
-                    scn.setdefault("adds", {}).setdefault("Customer Product Data", []).append({
-                        "Product": ap, "Customer": nc.strip(), "Location": loc_final, "Period": 2023, "UOM": "Each",
-                        "Demand": float(ad), "Lead Time": int(alt) if alt>0 else None
-                    })
-                st.success(f"Queued: Customer {nc} (Location {loc_final})")
-
-        # Add/Update warehouse
-        with tabs_crud[2]:
-            st.caption("Create or modify a warehouse row.")
-            mode_w = st.radio("Action", ["Add new","Update existing"], horizontal=True, key="crud_wh_mode")
-            if mode_w == "Add new":
-                nw = st.text_input("Warehouse name", key="crud_wh_new")
-                nlocw = st.text_input("Location", key="crud_wh_new_loc")
-                cap = st.number_input("Maximum Capacity", min_value=0.0, value=0.0, step=100.0)
-                f_open = st.checkbox("Force Open", value=True)
-                if st.button("➕ Queue warehouse add"):
-                    scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
-                    scn.setdefault("adds", {}).setdefault("Warehouse", []).append({
-                        "Warehouse": nw.strip(), "Location": nlocw.strip() or nw.strip(), "Maximum Capacity": float(cap),
-                        "Force Open": 1 if f_open else 0
-                    })
-                    st.success(f"Queued: Warehouse {nw}")
-            else:
-                uw = st.selectbox("Warehouse", warehouses, key="crud_wh_upd")
-                field = st.selectbox("Field", ["Maximum Capacity","Fixed Cost","Variable Cost","Force Open","Force Close"], key="crud_wh_field")
-                newv = st.text_input("New value (number or 0/1 for Force)", key="crud_wh_val")
-                if st.button("➕ Queue warehouse update"):
-                    v = float(newv) if field in {"Maximum Capacity","Fixed Cost","Variable Cost"} else int(float(newv or 0))
-                    scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
-                    scn.setdefault("warehouse_changes", []).append({"warehouse": uw, "field": field, "new_value": v})
-                    st.success(f"Queued: {uw} {field} -> {v}")
-
-        # Add/Update lane
-        with tabs_crud[3]:
-            st.caption("Create or modify a Transport Cost lane.")
-            m = st.selectbox("Mode of Transport", modes if modes else ["Secondary Delivery LTL"], key="crud_tc_mode")
-            fp = st.selectbox("Product (blank applies to all demand for To)", ["(blank)"] + products, key="crud_tc_prod")
-            fr = st.selectbox("From (use warehouse name or its Location)", warehouses + locations_w, key="crud_tc_from")
-            to = st.selectbox("To (use Customer name or Customers.Location)", customers + locations_c, key="crud_tc_to")
-            cpu = st.number_input("Cost Per UOM (leave 0 to compute via distance*cost_per_distance if your file uses those)", min_value=0.0, value=10.0, step=0.5)
-            avail = st.selectbox("Available", [1,0], index=0)
-            if st.button("➕ Queue lane upsert"):
-                prod_val = "" if fp == "(blank)" else fp
-                st.session_state.setdefault("manual_scenario", {"period": 2023})
-                st.session_state["manual_scenario"].setdefault("transport_updates", []).append({
-                    "mode": m, "product": prod_val, "from_location": fr, "to_location": to, "period": 2023,
-                    "fields": {"Cost Per UOM": float(cpu), "Available": int(avail)}
-                })
-                st.success(f"Queued: {m} {fr} -> {to} ({prod_val or 'ALL'})")
-
-        # Delete
-        with tabs_crud[4]:
-            st.caption("Careful: deletions require explicit checkbox during Process.")
-            del_kind = st.selectbox("What to delete?", ["Transport lane","Customer","Warehouse"], key="crud_del_kind")
-            if del_kind == "Transport lane":
-                m = st.selectbox("Mode", modes if modes else ["Secondary Delivery LTL"], key="crud_del_mode")
-                fr = st.text_input("From Location (warehouse or its location)", key="crud_del_from")
-                to = st.text_input("To Location (customer or its location)", key="crud_del_to")
-                prod = st.text_input("Product (exact; leave blank to match all rows)", key="crud_del_prod")
-                if st.button("➕ Queue delete"):
-                    st.session_state.setdefault("manual_scenario", {"period": 2023})
-                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Transport Cost", []).append({
-                        "Mode of Transport": m, "From Location": fr.strip(), "To Location": to.strip(), "Product": prod.strip(), "Period": 2023
-                    })
-                    st.success("Queued: delete lane")
-            elif del_kind == "Customer":
-                c = st.selectbox("Customer", customers, key="crud_del_cust")
-                if st.button("➕ Queue delete customer"):
-                    st.session_state.setdefault("manual_scenario", {"period": 2023})
-                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Customers", []).append({"Customer": c})
-                    st.success(f"Queued: delete customer {c}")
-            else:
-                w = st.selectbox("Warehouse", warehouses, key="crud_del_wh")
-                if st.button("➕ Queue delete warehouse"):
-                    st.session_state.setdefault("manual_scenario", {"period": 2023})
-                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Warehouse", []).append({"Warehouse": w})
-                    st.success(f"Queued: delete warehouse {w}")
-
-        queued = st.session_state.get("manual_scenario")
-        if queued:
-            st.markdown("**Queued Manual Scenario (will be merged with Prompt scenario)**")
-            st.json(queued)
-
-    # ---------------- Natural-language Prompt ----------------
-    st.subheader("🧠 Describe your what‑if scenario")
-    user_prompt = st.text_area("Prompt (or type 'run the base model')", height=120, key="user_prompt", value=user_prompt_default)
-    go = st.button("🚀 Process Scenario")
-
-    # Optional LLM vs Rules comparison
-    if show_llm_vs_rules and (user_prompt or "").strip():
-        tabs = st.tabs(["LLM Parser","Rules Parser","Diff"])
-        llm_scn = rules_scn = None
-        with tabs[0]:
-            if parse_with_llm is None or provider == "Rules only (no LLM)":
-                st.error("GenAI parser disabled or not available.")
-            else:
-                prov = "gemini" if provider.startswith("Google") else "openai"
-                try: llm_scn = parse_with_llm(user_prompt, dfs, default_period=2023, provider=prov)
-                except Exception as e: llm_scn = {}; st.error(f"LLM parse error: {e}")
-                if summarize_scenario: st.markdown("**Summary**"); st.markdown("\n".join(f"- {b}" for b in summarize_scenario(llm_scn)))
-                with st.expander("Advanced: raw JSON"): st.json(llm_scn)
-        with tabs[1]:
-            if parse_rules is None:
-                st.error("Rules parser not available.")
-            else:
-                try: rules_scn = parse_rules(user_prompt, dfs, default_period=2023)
-                except Exception as e: rules_scn = {}; st.error(f"Rules parse error: {e}")
-                if summarize_scenario: st.markdown("**Summary**"); st.markdown("\n".join(f"- {b}" for b in summarize_scenario(rules_scn)))
-                with st.expander("Advanced: raw JSON"): st.json(rules_scn)
-        with tabs[2]:
+    col_rules, col_llm = st.columns(2)
+    # RULES PARSER
+    with col_rules:
+        st.subheader("Rules Parser (deterministic)")
+        st.caption("Parses specific intents exactly—safe for production.")
+        prompt_rules = st.text_area("Write scenario (rules):", value=st.session_state.get("user_prompt") or "", key="user_prompt", height=120, placeholder="e.g., Increase Mono-Crystalline demand at Abu Dhabi by 10%")
+        if dyn_examples:
+            ex_choice = st.selectbox("Insert example (from file):", ["(choose one)"] + dyn_examples, key="ex_rules")
+            if st.button("Insert example (rules)"):
+                if ex_choice != "(choose one)":
+                    st.session_state["user_prompt"] = ex_choice
+                    st.experimental_rerun()
+        scn_rules: Dict[str, Any] = {}
+        if parse_rules is not None and st.button("Parse (Rules)"):
             try:
-                import difflib
-                a = json.dumps(llm_scn or {}, indent=2, sort_keys=True).splitlines()
-                b = json.dumps(rules_scn or {}, indent=2, sort_keys=True).splitlines()
-                diff = difflib.unified_diff(a, b, fromfile="LLM", tofile="Rules", lineterm="")
-                st.code("\n".join(diff) or "No differences.")
+                scn_rules = parse_rules(prompt_rules, st.session_state["dfs"], default_period=DEFAULT_PERIOD)
+                st.session_state["last_scenario_rules"] = scn_rules
+                st.success("Parsed (rules).")
             except Exception as e:
-                st.info(f"Diff unavailable: {e}")
+                st.error(f"Rules parser failed: {e}")
+        if st.session_state.get("last_scenario_rules"):
+            st.json(st.session_state["last_scenario_rules"])
 
-    # ---------------- Process scenario (Prompt + Manual) ----------------
-    if go and (user_prompt or "").strip():
-        # 1) Parse
-        try:
-            if user_prompt.strip().lower() in {"run the base model","run base model"}:
-                prompt_scn = {"period": 2023}
-                parsed_by = "base"
-            elif use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
-                prov = "gemini" if provider.startswith("Google") else "openai"
-                prompt_scn = parse_with_llm(user_prompt, dfs, default_period=2023, provider=prov); parsed_by = provider
-            else:
-                prompt_scn = parse_rules(user_prompt, dfs, default_period=2023) if parse_rules else {}
-                parsed_by = "rules"
-        except Exception as e:
-            st.error(f"❌ Parsing failed: {e}"); st.stop()
+    # LLM PARSER
+    with col_llm:
+        st.subheader("LLM Parser (Gemini/OpenAI)")
+        st.caption("Optional. Uses GenAI to interpret free text.")
+        prompt_llm = st.text_area("Write scenario (LLM):", value=st.session_state.get("user_prompt_llm") or "", key="user_prompt_llm", height=120, placeholder="Natural language what‑if")
+        if dyn_examples:
+            ex_choice2 = st.selectbox("Insert example (LLM):", ["(choose one)"] + dyn_examples, key="ex_llm")
+            if st.button("Insert example (LLM)"):
+                if ex_choice2 != "(choose one)":
+                    st.session_state["user_prompt_llm"] = ex_choice2
+                    st.experimental_rerun()
+        scn_llm: Dict[str, Any] = {}
+        if parse_with_llm is not None and st.button("Parse (LLM)"):
+            try:
+                provider = "gemini" if prov == "Google Gemini" else ("openai" if prov == "OpenAI" else "none")
+                scn_llm = parse_with_llm(prompt_llm, st.session_state["dfs"], default_period=DEFAULT_PERIOD, provider=provider)
+                st.session_state["last_scenario_llm"] = scn_llm
+                st.success("Parsed (LLM).")
+            except Exception as e:
+                st.error(f"LLM parser failed: {e}")
+        if st.session_state.get("last_scenario_llm"):
+            st.json(st.session_state["last_scenario_llm"])
 
-        # 2) Merge Manual Edits
-        manual = st.session_state.get("manual_scenario", {})
-        scenario = {}
-        scenario["period"] = (manual.get("period") or prompt_scn.get("period") or 2023)
-        for key in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
-            scenario[key] = []
-            if isinstance(prompt_scn.get(key), list): scenario[key].extend(prompt_scn[key])
-            if isinstance(manual.get(key), list):     scenario[key].extend(manual[key])
-        for key in ["adds","deletes"]:
-            if prompt_scn.get(key) or manual.get(key):
-                scenario[key] = {}
-                if isinstance(prompt_scn.get(key), dict):
-                    for k,v in prompt_scn[key].items():
-                        scenario[key].setdefault(k, []).extend(v)
-                if isinstance(manual.get(key), dict):
-                    for k,v in manual[key].items():
-                        scenario[key].setdefault(k, []).extend(v)
-
-        st.subheader(f"Scenario to apply ({parsed_by} + manual)")
-        if summarize_scenario: st.markdown("\n".join(f"- {b}" for b in summarize_scenario(scenario)))
-        with st.expander("Advanced: raw JSON"): st.json(scenario)
-
-        # 3) Deletion safety
-        pending_del = sum(len(v) for v in (scenario.get("deletes") or {}).values()) if isinstance(scenario.get("deletes"), dict) else 0
-        allow_delete = True
-        if pending_del > 0:
-            allow_delete = st.checkbox(f"🛑 Apply deletions ({pending_del} row(s))", value=False)
-
-        # 4) Before copies
-        b_cpd = dfs.get("Customer Product Data", pd.DataFrame()).copy()
-        b_wh  = dfs.get("Warehouse", pd.DataFrame()).copy()
-        b_sp  = dfs.get("Supplier Product", pd.DataFrame()).copy()
-        b_tc  = dfs.get("Transport Cost", pd.DataFrame()).copy()
-        b_cu  = dfs.get("Customers", pd.DataFrame()).copy()
-
-        # 5) Apply
-        try:
-            newdfs = apply_scenario(dfs, scenario, allow_delete=allow_delete)
-        except Exception as e:
-            st.error(f"❌ Applying scenario failed: {e}"); st.stop()
-
-        a_cpd = newdfs.get("Customer Product Data", pd.DataFrame()).copy()
-        a_wh  = newdfs.get("Warehouse", pd.DataFrame()).copy()
-        a_sp  = newdfs.get("Supplier Product", pd.DataFrame()).copy()
-        a_tc  = newdfs.get("Transport Cost", pd.DataFrame()).copy()
-        a_cu  = newdfs.get("Customers", pd.DataFrame()).copy()
-
-        # 6) Auto-connect (doesn't count as "user edits" for delta visibility)
-        auto = st.checkbox("🔗 Auto-create missing lanes for feasibility (demo)", value=True)
-        auto_created = 0
-        if auto:
-            newdfs, auto_created = autoconnect_lanes(newdfs, period=scenario.get("period", 2023), default_cost=10.0)
-            if auto_created > 0: st.info(f"Auto-connect created {auto_created} placeholder lane(s).")
-
-        # 7) Optimize
-        if run_optimizer is None: st.error("Optimizer module missing."); st.stop()
-        kpis, diag = run_optimizer(newdfs, period=scenario.get("period", 2023))
-
-        # Persist every piece needed for sticky results
-        st.session_state["last_newdfs"]  = newdfs
-        st.session_state["last_kpis"]    = kpis
-        st.session_state["last_diag"]    = diag
-        st.session_state["last_period"]  = scenario.get("period", 2023)
-        st.session_state["last_prompt"]  = user_prompt
-        st.session_state["last_scenario"]= scenario
-
-        # Track before/after for delta (only if user made edits)
-        user_change_count = 0
-        for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
-            user_change_count += len(scenario.get(k, []) or [])
-        if isinstance(scenario.get("adds"), dict):
-            user_change_count += sum(len(v) for v in scenario["adds"].values())
-        if isinstance(scenario.get("deletes"), dict):
-            user_change_count += sum(len(v) for v in scenario["deletes"].values())
-        st.session_state["last_before_after"] = {
-            "before": {
-                "Customer Product Data": b_cpd, "Warehouse": b_wh, "Supplier Product": b_sp, "Transport Cost": b_tc, "Customers": b_cu
-            },
-            "after": {
-                "Customer Product Data": a_cpd, "Warehouse": a_wh, "Supplier Product": a_sp, "Transport Cost": a_tc, "Customers": a_cu
-            },
-            "user_change_count": user_change_count
-        }
-
-        # Render results now
-        render_results(
-            dfs=newdfs, kpis=kpis, diag=diag, period=scenario.get("period", 2023),
-            scenario=scenario, user_prompt=user_prompt,
-            before_after=st.session_state["last_before_after"]
-        )
-
-    # --- Sticky results view (so changing Gemini/OpenAI radio won't reset the page) ---
-    elif st.session_state.get("last_newdfs") is not None and st.session_state.get("last_kpis") is not None:
-        render_results(
-            dfs=st.session_state["last_newdfs"],
-            kpis=st.session_state["last_kpis"],
-            diag=st.session_state["last_diag"],
-            period=st.session_state.get("last_period", 2023),
-            scenario=st.session_state.get("last_scenario", {}),
-            user_prompt=st.session_state.get("last_prompt", ""),
-            before_after=st.session_state.get("last_before_after", None)
-        )
-
-else:
-    st.info("Upload your base case to begin. Or download a sample template:")
-    raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
-    if os.path.exists("sample_base_case.xlsx"):
-        with open("sample_base_case.xlsx","rb") as f:
-            st.download_button("⬇️ Download Sample Base Case Template", data=f, file_name="sample_base_case.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # Choose scenario to run
+    st.markdown("### Scenario to run")
+    mode = st.radio("Choose edits", ["Base (no edits)", "Use Rules result", "Use LLM result"], horizontal=True, key="scenario_mode")
+    if mode == "Use Rules result":
+        scenario = st.session_state.get("last_scenario_rules") or {}
+    elif mode == "Use LLM result":
+        scenario = st.session_state.get("last_scenario_llm") or {}
     else:
-        st.markdown(f"[⬇️ Download Sample Base Case Template]({raw_url})")
-        st.caption("Tip: add `sample_base_case.xlsx` into repo root to enable in‑app download.")
-    st.subheader("💡 Suggested prompts")
-    with st.expander("Show suggestions"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Static**")
-            for ex in STATIC_EXAMPLES: st.code(ex, language="text")
-            pick = st.selectbox("Insert static example:", ["(choose)"] + STATIC_EXAMPLES, key="pick_static_nf")
-            if st.button("Insert static", key="insert_static_nf"):
-                if pick != "(choose)":
-                    st.session_state["prefill_prompt"] = pick; st.rerun()
-        with c2:
-            st.markdown("**From your file**"); st.info("Upload a file to generate tailored prompts.")
-    st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt", value=user_prompt_default)
+        scenario = {}
+
+    # ----------------------------- Process Scenario -----------------------------
+
+    if st.button("🚀 Process Scenario & Optimize"):
+        if apply_scenario_edits is None or run_optimizer is None:
+            st.error("Updater or Optimizer not available.")
+        else:
+            try:
+                before = st.session_state["dfs"].copy()
+                # Capture 'before' copies for diffs
+                before_cpd = _safe_df(before.get("Customer Product Data")).copy()
+                before_wh  = _safe_df(before.get("Warehouse")).copy()
+                before_sp  = _safe_df(before.get("Supplier Product")).copy()
+                before_tc  = _safe_df(before.get("Transport Cost")).copy()
+
+                # Apply scenario (or pass empty)
+                updated = apply_scenario_edits(before, scenario or {}, default_period=DEFAULT_PERIOD)
+
+                # Diffs only if changes actually occurred
+                diffs = diff_tables(
+                    before={"Customer Product Data": before_cpd, "Warehouse": before_wh, "Supplier Product": before_sp, "Transport Cost": before_tc},
+                    after={"Customer Product Data": _safe_df(updated.get("Customer Product Data")), "Warehouse": _safe_df(updated.get("Warehouse")), "Supplier Product": _safe_df(updated.get("Supplier Product")), "Transport Cost": _safe_df(updated.get("Transport Cost"))},
+                ) if diff_tables is not None else {}
+
+                st.session_state["last_updated_dfs"] = updated
+                st.session_state["last_scenario"] = scenario
+
+                # Optimization
+                kpis, diag = run_optimizer(updated, period=scenario.get("period", DEFAULT_PERIOD))
+                st.session_state["kpis"] = kpis
+                st.session_state["diag"] = diag
+
+                # Flows → geo
+                if flows_to_geo is not None:
+                    geo_flows = flows_to_geo(diag.get("flows", []), updated)
+                    st.session_state["flows_geo"] = geo_flows
+                else:
+                    st.session_state["flows_geo"] = pd.DataFrame()
+
+                st.success("Scenario applied and optimized.")
+                # Show diffs only if there are changes
+                if _has_diffs(diffs):
+                    with st.expander("🔁 Deltas written to sheets (only if changed)", expanded=False):
+                        for name, df in diffs.items():
+                            if isinstance(df, pd.DataFrame) and not df.empty:
+                                st.markdown(f"**{name}**")
+                                st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("No changes were applied to the sheets (base model).")
+
+            except Exception as e:
+                st.error(f"Processing failed: {e}")
+
+# ----------------------------- Results: KPIs + Map + Ask GENIE -----------------------------
+
+if st.session_state["kpis"]:
+    st.markdown("---")
+    st.header("Results")
+
+    col1, col2, col3, col4 = st.columns(4)
+    k = st.session_state["kpis"]
+    with col1:
+        st.metric("Status", k.get("status", "n/a"))
+    with col2:
+        st.metric("Service %", k.get("service_pct", 0))
+    with col3:
+        st.metric("Total Demand", int(k.get("total_demand", 0) or 0))
+    with col4:
+        served = int(k.get("served", 0) or 0)
+        st.metric("Served Units", served)
+
+    # Flow map (after optimization)
+    if st.session_state["last_updated_dfs"] is not None and build_nodes is not None:
+        nodes_after = build_nodes(st.session_state["last_updated_dfs"])
+    else:
+        nodes_after = None
+
+    st.subheader("Solved Map — Nodes & Flows")
+    color_by = st.checkbox("Color flows by product", value=st.session_state.get("color_by_product", True), key="color_by_product")
+    layers = []
+    if isinstance(nodes_after, pd.DataFrame) and not nodes_after.empty:
+        layers.extend(_prep_node_layers(nodes_after))
+    arcs = st.session_state.get("flows_geo")
+    flow_layer = _prep_flow_layer(arcs, color_by_product=color_by) if isinstance(arcs, pd.DataFrame) else None
+    if flow_layer:
+        layers.append(flow_layer)
+    # Center on nodes if possible
+    if isinstance(nodes_after, pd.DataFrame) and not nodes_after.empty and guess_map_center is not None:
+        lat, lon = guess_map_center(nodes_after, default=(30.0, 15.0))
+    else:
+        lat, lon = (30.0, 15.0)
+    view = pdk.ViewState(latitude=lat, longitude=lon, zoom=3.7)
+    st.pydeck_chart(pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view, layers=layers))
+
+    # -------------------- Ask GENIE (Q&A) just BELOW the solved map --------------------
+    st.subheader("Ask GENIE")
+    st.caption("Grounded Q&A on your data. Try: *Why is Abu Dhabi unserved?*, *Which countries have suppliers?*, *Why no supplier in India?*")
+
+    q = st.text_input("Your question:", key="qa_input", value=st.session_state.get("qa_input_val", ""))
+    ask_col1, ask_col2 = st.columns([1,3])
+    with ask_col1:
+        ask_btn = st.button("Ask")
+    with ask_col2:
+        st.caption(f"Provider: {prov}")
+
+    if ask_btn and answer_question is not None:
+        try:
+            provider = "gemini" if prov == "Google Gemini" else ("openai" if prov == "OpenAI" else "none")
+            ans = answer_question(
+                q,
+                st.session_state.get("kpis") or {},
+                st.session_state.get("diag") or {},
+                provider=provider,
+                dfs=st.session_state.get("last_updated_dfs") or st.session_state.get("dfs"),
+                model_index=st.session_state.get("model_index"),
+                force_llm=(provider in ("gemini", "openai")),
+            )
+            st.session_state["qa_answer"] = ans
+        except Exception as e:
+            st.session_state["qa_answer"] = f"Q&A failed: {e}"
+
+    if st.session_state.get("qa_answer"):
+        st.markdown("**Answer:**")
+        st.write(st.session_state["qa_answer"])
+
+# ----------------------------- Manual Edits / CRUD (incl. Location helper) -----------------------------
+
+if st.session_state["dfs"]:
+    st.markdown("---")
+    st.header("Manual Edits (Advanced)")
+    st.caption("Make targeted changes directly. Use with care.")
+
+    tabs = st.tabs(["Add/Update Locations", "Add Row", "Delete Row"])
+
+    # Locations Helper — deterministic (Gemini parses text only, geocode is deterministic)
+    with tabs[0]:
+        st.markdown("**📍 Location helper (deterministic geocoding)**")
+        loc_query = st.text_input("City/Location text (e.g., 'Prague_LDC, Czechia')", key="loc_query")
+        use_online = st.checkbox("Allow online geocoding (Nominatim)", value=False, help="Enable also by setting GENIE_GEOCODE_ONLINE=true in environment.")
+        if st.button("Resolve coordinates"):
+            if suggest_location_candidates is None:
+                st.warning("engine.genai.suggest_location_candidates not available.")
+            else:
+                provider = "gemini" if prov == "Google Gemini" else ("openai" if prov == "OpenAI" else "none")
+                cands = suggest_location_candidates(loc_query, st.session_state["dfs"], provider=provider, allow_online=use_online)
+                if not cands:
+                    st.warning("No deterministic match. Add to 'Locations' manually or enable online geocoding.")
+                else:
+                    best = cands[0]
+                    st.success(f"Found: {best['location']} ({best['country']}) → lat={best['lat']:.4f}, lon={best['lon']:.4f}")
+                    if st.button("Add/Update in Locations"):
+                        if ensure_location_row is None:
+                            st.warning("engine.geo.ensure_location_row not available.")
+                        else:
+                            newdfs = ensure_location_row(st.session_state["dfs"], best["location"], best["country"], best["lat"], best["lon"])
+                            st.session_state["dfs"] = newdfs
+                            # refresh model index
+                            if build_model_index is not None:
+                                st.session_state["model_index"] = build_model_index(newdfs, period=DEFAULT_PERIOD)
+                            st.success("Locations sheet updated.")
+
+    # Add Row UI
+    with tabs[1]:
+        st.markdown("**Add a row to a sheet**")
+        sheet = st.selectbox("Sheet", ["Customers", "Warehouse", "Supplier Product", "Customer Product Data", "Transport Cost", "Locations"])
+        st.caption("Fill columns as needed; leave blank for optional fields.")
+        # Build blank row from existing columns (if present), else a common set:
+        cols_guess = list((_safe_df(st.session_state["dfs"].get(sheet))).columns) or {
+            "Customers": ["Customer", "Location"],
+            "Warehouse": ["Warehouse", "Location", "Maximum Capacity", "Force Open", "Force Close"],
+            "Supplier Product": ["Product", "Supplier", "Location", "Period", "Available"],
+            "Customer Product Data": ["Product", "Customer", "Location", "Period", "Demand", "Lead Time", "UOM", "Variable Cost"],
+            "Transport Cost": ["Mode of Transport", "Product", "From Location", "To Location", "Period", "Available", "Cost Per UOM"],
+            "Locations": ["Location", "Country", "Latitude", "Longitude"],
+        }[sheet]
+        # inputs
+        new_row: Dict[str, Any] = {}
+        for c in cols_guess:
+            val = st.text_input(c, key=f"add_{sheet}_{c}")
+            new_row[c] = val
+        if st.button("➕ Add row"):
+            df = _safe_df(st.session_state["dfs"].get(sheet)).copy()
+            if df.empty:
+                df = pd.DataFrame(columns=cols_guess)
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            st.session_state["dfs"][sheet] = df
+            st.success(f"Row added to {sheet}. Remember to re-run scenario & optimize.")
+
+    # Delete Row UI (very simple key-based match)
+    with tabs[2]:
+        st.markdown("**Delete row(s) by simple filter**")
+        sheet_d = st.selectbox("Sheet", ["Customers", "Warehouse", "Supplier Product", "Customer Product Data", "Transport Cost", "Locations"], key="del_sheet")
+        key_col = st.text_input("Filter column (exact)", key="del_col")
+        key_val = st.text_input("Value equals", key="del_val")
+        if st.button("🗑️ Delete"):
+            df = _safe_df(st.session_state["dfs"].get(sheet_d)).copy()
+            if df.empty or key_col not in df.columns:
+                st.warning("Sheet empty or column not found.")
+            else:
+                before_n = len(df)
+                df = df[df[key_col].astype(str) != key_val]
+                st.session_state["dfs"][sheet_d] = df
+                st.success(f"Deleted {before_n - len(df)} row(s) from {sheet_d}. Re-run to apply.")
+
+# ----------------------------- Footer -----------------------------
+st.markdown("---")
+st.caption("© GENIE — Supply Chain Network Designer. This app does not send your workbook to an LLM. LLMs are used only for text understanding; all numbers and coordinates are computed deterministically.")
