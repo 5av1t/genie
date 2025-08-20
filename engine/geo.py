@@ -95,7 +95,6 @@ def build_nodes(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             lat, lon = resolve_latlon(loc_s, ext)
             if lat is not None and lon is not None:
                 rows.append({"name": c_s, "type": "customer", "location": loc_s, "lat": lat, "lon": lon})
-    # Fallback to CPD
     if not isinstance(custs, pd.DataFrame) or custs.empty:
         cpd = dfs.get("Customer Product Data")
         if isinstance(cpd, pd.DataFrame) and not cpd.empty:
