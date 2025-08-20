@@ -4,3 +4,4 @@ openpyxl
 pulp
 pydeck
 openai>=1.50.0
+google-generativeai>=0.7.0
