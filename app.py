@@ -1,4 +1,4 @@
-# --- GENIE: Streamlit App (Gemini + OpenAI + Rules, Dynamic Examples, Auto-Connect, Maps, Optimizer) ---
+# --- GENIE: Streamlit App (Gemini + OpenAI + Rules, CRUD flows, Dynamic Examples, Auto-Connect, Maps, Optimizer) ---
 
 import os
 from io import BytesIO
@@ -22,11 +22,6 @@ except Exception:
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
 # ========= Secrets → env (OpenAI + Gemini) =========
-# Streamlit Cloud: set in Settings → Secrets:
-# [openai]
-# api_key = "sk-..."
-# [gemini]
-# api_key = "YOUR_GEMINI_API_KEY"
 if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
@@ -100,7 +95,7 @@ with st.sidebar:
         "Model Provider",
         ["Google Gemini (free tier)", "OpenAI", "Rules only (no LLM)"],
         index=0,
-        help="Use Gemini for free starter usage. You can switch to OpenAI if you have billing enabled. Rules-only disables GenAI parsing & example generation.",
+        help="Use Gemini for free starter usage. Switch to OpenAI if you have billing. Rules-only disables GenAI parsing & example generation.",
     )
     use_llm_parser = st.checkbox(
         "Use GenAI parser for scenarios",
@@ -116,6 +111,10 @@ STATIC_EXAMPLES = [
     "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
     "Enable Thin-Film at Antalya_FG",
     "Set Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline to cost per uom = 9.5",
+    # CRUD examples
+    "Add customer Muscat; demand 8000 of Mono-Crystalline; lead time 9",
+    "Add warehouse Prague_CDC at Prague; Maximum Capacity 30000; force open",
+    "Delete Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline in 2023",
 ]
 
 with st.expander("💡 Prompt examples (static fallback)"):
@@ -254,7 +253,6 @@ if uploaded_file:
         st.stop()
 
     with st.expander("✅ Sheet Validation Report"):
-        # Per-sheet status; skip non-dict entries like "_warnings"
         for sheet, rep in validation_report.items():
             if not isinstance(rep, dict):
                 continue
@@ -273,7 +271,6 @@ if uploaded_file:
 
     # ---- Dynamic GenAI examples (Gemini/OpenAI) ----
     st.subheader("💡 Prompt examples (from your file)")
-    # Cache by a simple fingerprint of sheet names + sizes
     try:
         fp_hasher = hashlib.sha1()
         fp_hasher.update("|".join(sorted([f"{k}:{v.shape[0]}x{v.shape[1]}" for k, v in dataframes.items() if isinstance(v, pd.DataFrame)])).encode())
@@ -416,15 +413,26 @@ if uploaded_file:
         # Special: "run base model" → don't apply changes
         run_base = str(st.session_state["user_prompt"]).strip().lower() in {"run the base model", "run base model"}
 
+        # Deletion safety
+        pending_deletes = sum(len(v) for v in (scenario.get("deletes") or {}).values()) if isinstance(scenario.get("deletes"), dict) else 0
+        allow_delete = True
+        if pending_deletes > 0:
+            allow_delete = st.checkbox(
+                f"🛑 Apply deletions ({pending_deletes} row(s))",
+                value=False,
+                help="Deletions are permanent in this session. Untick to ignore deletes."
+            )
+
         # 2) Apply scenario to sheets (or skip if base)
         before_cpd = dataframes.get("Customer Product Data", pd.DataFrame()).copy()
         before_wh  = dataframes.get("Warehouse", pd.DataFrame()).copy()
         before_sp  = dataframes.get("Supplier Product", pd.DataFrame()).copy()
         before_tc  = dataframes.get("Transport Cost", pd.DataFrame()).copy()
+        before_cu  = dataframes.get("Customers", pd.DataFrame()).copy()
 
         if not run_base:
             try:
-                updated = apply_scenario(dataframes, scenario)
+                updated = apply_scenario(dataframes, scenario, allow_delete=allow_delete)
             except Exception as e:
                 st.error(f"❌ Applying scenario failed: {e}")
                 st.stop()
@@ -435,23 +443,28 @@ if uploaded_file:
         after_wh  = updated.get("Warehouse", pd.DataFrame()).copy()
         after_sp  = updated.get("Supplier Product", pd.DataFrame()).copy()
         after_tc  = updated.get("Transport Cost", pd.DataFrame()).copy()
+        after_cu  = updated.get("Customers", pd.DataFrame()).copy()
 
         # 2.5) Quick preview
         st.subheader("📋 Before vs After (Quick Preview)")
-        tabs = st.tabs(["Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
+        tabs = st.tabs(["Customers", "Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
         with tabs[0]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_cu.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_cu.head(25), use_container_width=True)
+        with tabs[1]:
             colA, colB = st.columns(2)
             with colA: st.markdown("**Before**"); st.dataframe(before_cpd.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_cpd.head(25), use_container_width=True)
-        with tabs[1]:
+        with tabs[2]:
             colA, colB = st.columns(2)
             with colA: st.markdown("**Before**"); st.dataframe(before_wh.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_wh.head(25), use_container_width=True)
-        with tabs[2]:
+        with tabs[3]:
             colA, colB = st.columns(2)
             with colA: st.markdown("**Before**"); st.dataframe(before_sp.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_sp.head(25), use_container_width=True)
-        with tabs[3]:
+        with tabs[4]:
             colA, colB = st.columns(2)
             with colA: st.markdown("**Before**"); st.dataframe(before_tc.head(25), use_container_width=True)
             with colB: st.markdown("**After**");  st.dataframe(after_tc.head(25), use_container_width=True)
@@ -546,6 +559,11 @@ if uploaded_file:
 
         # 5) Delta Views
         st.subheader("Δ Delta Views (Changes Only)")
+        show_delta_block(
+            "Customers",
+            before_cu, after_cu,
+            ["Customer", "Location"],
+        )
         show_delta_block(
             "Customer Product Data",
             before_cpd, after_cpd,
