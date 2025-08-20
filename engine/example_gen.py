@@ -1,55 +1,56 @@
-from __future__ import annotations
-from typing import Dict, List
+from typing import Dict, Any, List
 import pandas as pd
+import random
 
-DEFAULT_PERIOD = 2023
+def _first_values(df: pd.DataFrame, col: str, k: int = 3) -> List[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty or col not in df.columns:
+        return []
+    vals = [str(x) for x in df[col].dropna().astype(str).unique().tolist()]
+    return vals[:k]
 
-def _safe_df(df) -> pd.DataFrame:
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+def examples_for_file(dfs: Dict[str, pd.DataFrame], provider: str = "gemini") -> List[str]:
+    """
+    Build natural-language examples ONLY from entities present in the uploaded file.
+    """
+    products = _first_values(dfs.get("Products"), "Product", 3)
+    if not products:
+        # fallback: infer from CPD
+        cpd = dfs.get("Customer Product Data")
+        if isinstance(cpd, pd.DataFrame) and not cpd.empty and "Product" in cpd.columns:
+            products = _first_values(cpd, "Product", 3)
+    customers = _first_values(dfs.get("Customers"), "Customer", 6)
+    warehouses = _first_values(dfs.get("Warehouse"), "Warehouse", 4)
+    modes = _first_values(dfs.get("Mode of Transport"), "Mode of Transport", 3)
 
-def _first(series: pd.Series, fallback: str = "") -> str:
-    vals = [str(x) for x in series.dropna().tolist() if str(x).strip()]
-    return vals[0] if vals else fallback
+    ex: List[str] = []
+    ex.append("run the base model")
 
-def rules_examples(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) -> List[str]:
-    if not isinstance(dfs, dict) or not dfs:
-        return [
-            "Increase <Product> demand at <Customer> by 10% and set Lead Time to 8",
-            "Cap <Warehouse> Maximum Capacity at 25000; force close <Warehouse2>",
-            "Enable <Product> at <Supplier>",
-            "Set <Mode> lane <From> → <To> for <Product> to Cost Per UOM = 9.5",
-        ]
+    # Demand tweak
+    if products and customers:
+        ex.append(f"Increase {products[0]} demand at {customers[0]} by 10% and set lead time to 8")
 
-    products = _safe_df(dfs.get("Products"))
-    wh = _safe_df(dfs.get("Warehouse"))
-    cust = _safe_df(dfs.get("Customers"))
-    sp = _safe_df(dfs.get("Supplier Product"))
-    tc = _safe_df(dfs.get("Transport Cost"))
-    mot = _safe_df(dfs.get("Mode of Transport"))
+    # Warehouse capacity / force open-close
+    if warehouses:
+        ex.append(f"Cap {warehouses[0]} Maximum Capacity at 25000")
+        if len(warehouses) > 1:
+            ex.append(f"Force close {warehouses[1]}")
 
-    prod_name = _first(products.get("Product", pd.Series(dtype=str)), "YourProduct")
-    cust_name = _first(cust.get("Customer", pd.Series(dtype=str)), "YourCustomer")
-    cust_loc  = _first(cust.get("Location", pd.Series(dtype=str)), cust_name)
-    wh1 = _first(wh.get("Warehouse", pd.Series(dtype=str)), "YourWarehouse1")
-    wh2 = _first(wh.get("Warehouse", pd.Series(dtype=str)).iloc[1:] if "Warehouse" in wh.columns and len(wh) > 1 else pd.Series(dtype=str), "YourWarehouse2")
-    sup_name = _first(sp.get("Supplier", pd.Series(dtype=str)), "YourSupplier")
-    mode     = _first(mot.get("Mode of Transport", pd.Series(dtype=str)), "YourMode")
-    from_loc = _first(tc.get("From Location", pd.Series(dtype=str)), wh1)
-    to_loc   = _first(tc.get("To Location", pd.Series(dtype=str)), cust_loc)
-    lane_prod = _first(tc.get("Product", pd.Series(dtype=str)), prod_name)
+    # Transport lane cost
+    if modes and products and customers and warehouses:
+        ex.append(f"Set {modes[0]} lane {warehouses[0]} -> {customers[1]} for {products[0]} to cost per uom = 9.5")
 
-    examples = [
-        f"Increase {prod_name} demand at {cust_name} by 10% and set Lead Time to 8",
-        f"Cap {wh1} Maximum Capacity at 25000; force close {wh2}",
-        f"Enable {prod_name} at {sup_name}",
-        f"Set {mode} lane {from_loc} → {to_loc} for {lane_prod} to Cost Per UOM = 9.5",
-    ]
-    seen = set(); out = []
-    for e in examples:
-        if e not in seen:
-            seen.add(e); out.append(e)
-    return out
+    # Adds
+    if customers and products:
+        ex.append(f"Add customer {customers[-1]} at {customers[-1]}; demand 6000 of {products[0]}; lead time 7")
+    if warehouses:
+        ex.append(f"Add warehouse {warehouses[-1]} at {warehouses[-1]}; Maximum Capacity 30000; force open")
 
-def llm_examples(dfs: Dict[str, pd.DataFrame], provider: str = "none", period: int = DEFAULT_PERIOD) -> List[str]:
-    # Keep deterministic to avoid hallucinations
-    return rules_examples(dfs, period=period)
+    # Deletes
+    if modes and products and customers and warehouses:
+        ex.append(f"Delete {modes[0]} lane {warehouses[0]} -> {customers[0]} for {products[0]} in 2023")
+
+    # Shuffle a bit but keep base model as first
+    base = ex[0]
+    rest = ex[1:]
+    random.shuffle(rest)
+    return [base] + rest[:7]
