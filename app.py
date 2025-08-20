@@ -1,11 +1,11 @@
 # --- GENIE: Supply Chain Network Designer (complete app.py) ---
 # Upload Excel → (Prompt OR Manual CRUD) → Apply → Optimize → KPIs + Maps → Q&A → Export
+# Sticky results across reruns; Ask GENIE under the map; Delta tables only when user actually edited.
 
 import os
 from io import BytesIO
 import json
 import hashlib
-import math
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 
@@ -22,7 +22,7 @@ except Exception:
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# --- Load secrets (kept hidden) ---
+# --- Secrets (keep API keys out of code) ---
 for block in ("openai", "gcp", "gemini"):
     if block in st.secrets:
         for k, v in st.secrets[block].items():
@@ -31,7 +31,7 @@ for block in ("openai", "gcp", "gemini"):
 if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
     os.environ["GEMINI_API_KEY"] = st.secrets["gemini"]["api_key"]
 
-# --- Import engine modules ---
+# --- Import engine modules (optional GenAI; rest required) ---
 missing = []
 try:
     from engine.loader import load_and_validate_excel as loader
@@ -64,7 +64,7 @@ except ModuleNotFoundError:
     missing.append("engine/geo.py (build_nodes, flows_to_geo, guess_map_center)")
     build_nodes = flows_to_geo = guess_map_center = None
 
-# GenAI is optional; we’ll still run grounded
+# GenAI optional
 try:
     from engine.genai import parse_with_llm, summarize_scenario, answer_question
 except ModuleNotFoundError:
@@ -88,10 +88,11 @@ with st.sidebar:
     provider = st.selectbox(
         "Scenario Parser Provider",
         ["Google Gemini (free tier)", "OpenAI", "Rules only (no LLM)"],
-        index=0
+        index=0,
+        key="cfg_provider"
     )
-    use_llm_parser = st.checkbox("Use GenAI parser for scenarios", value=(provider != "Rules only (no LLM)"))
-    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False)
+    use_llm_parser = st.checkbox("Use GenAI parser for scenarios", value=(provider != "Rules only (no LLM)"), key="cfg_use_llm")
+    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False, key="cfg_debug_compare")
 
     st.markdown("---")
     st.subheader("🧠 GENIE can:")
@@ -102,15 +103,12 @@ with st.sidebar:
         "- Set **Transport Cost** per lane (Mode, From, To, Product, Period)\n"
         "- **Add / Delete** customers, warehouses, lanes, demand rows\n"
         "- Run the **base model** (no edits)\n"
-        "- **Ask about results** (lowest throughput, top lanes, bottlenecks, unserved customers)"
+        "- **Ask about results** (unserved customers, service %, lowest-demand customers, throughput, top flows)"
     )
     st.markdown("---")
-    st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local: `.streamlit/secrets.toml` (add gemini/api_key or openai/api_key).")
+    st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local dev: `.streamlit/secrets.toml` (add gemini/api_key or openai/api_key).")
 
-# --- Upload ---
-uploaded = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
-
-# --- Helpers (delta & autoconnect) ---
+# ---------------- Helpers: deltas & autoconnect ----------------
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, keys: list) -> pd.DataFrame:
     if after is None or not isinstance(after, pd.DataFrame) or after.empty:
         return pd.DataFrame(columns=keys + ["Field","Before","After","ChangeType"])
@@ -147,6 +145,7 @@ def show_delta(title, before, after, keys):
     st.success(f"Applied changes: {updated} updated row(s), {added} new row(s).")
 
 def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
+    """Create placeholder lanes from every warehouse Location to every customer with positive demand, if missing."""
     wh = dfs.get("Warehouse", pd.DataFrame())
     cpd = dfs.get("Customer Product Data", pd.DataFrame())
     tc  = dfs.get("Transport Cost", pd.DataFrame())
@@ -161,7 +160,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     need = set()
     if isinstance(cpd, pd.DataFrame) and not cpd.empty:
         use = cpd.copy()
-        if "Period" in use.columns: use = use[use["Period"] == 2023]
+        if "Period" in use.columns: use = use[use["Period"] == period]
         for _, r in use.iterrows():
             cust = str(r.get("Customer")); prod = str(r.get("Product"))
             try: dem = float(r.get("Demand", 0) or 0)
@@ -171,7 +170,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         for _, r in tc.iterrows():
             try:
-                if int(r.get("Period", 2023)) != 2023: continue
+                if int(r.get("Period", period)) != period: continue
             except Exception: continue
             existing.add((str(r.get("From Location")), str(r.get("To Location")), str(r.get("Product"))))
     new_rows = []
@@ -180,7 +179,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
             key = (str(from_loc), str(to_cust), str(prod))
             if key in existing: continue
             new_rows.append({
-                "Mode of Transport":"Secondary Delivery LTL","Product":prod,"From Location":from_loc,"To Location":to_cust,"Period":2023,
+                "Mode of Transport":"Secondary Delivery LTL","Product":prod,"From Location":from_loc,"To Location":to_cust,"Period":period,
                 "UOM":"Each","Available":1,"Retrieve Distance":0.0,"Average Load Size":1.0,"Cost Per UOM":float(default_cost),
                 "Cost per Distance":0.0,"Cost per Trip":0.0,"Minimum Cost Per Trip":0.0
             })
@@ -226,30 +225,23 @@ def _unserved_customers(dfs: Dict[str, pd.DataFrame], diag: Dict[str, Any], peri
     return len(unserved_list), unserved_list
 
 def grounded_answer(q: str, dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
-    """Simple recognizers for common questions; return textual answer."""
     qs = (q or "").strip().lower()
-
-    # 1) how many customers are unserved / not served
+    # unserved customers
     if any(t in qs for t in ["unserved", "not served", "not-served", "unmet"]):
         cnt, lst = _unserved_customers(dfs, diag, period)
         preview = ", ".join([f"{c}({int(u)})" for c, u in lst[:10]]) if lst else "—"
         return f"{cnt} customer(s) have unmet demand. Top gaps: {preview}"
-
-    # 2) least customer demand / lowest demand customers
+    # least/lowest demand
     if any(t in qs for t in ["least demand", "lowest demand", "smallest demand"]):
         dem = _demand_by_customer(dfs, period)
-        if not dem:
-            return "No demand found for the selected period."
-        # list 10 least with demand > 0
+        if not dem: return "No demand found for the selected period."
         items = [(c, v) for c, v in dem.items() if v > 0]
-        if not items:
-            return "All customers have zero demand."
+        if not items: return "All customers have zero demand."
         items.sort(key=lambda x: (x[1], x[0]))
         top = ", ".join([f"{c}({int(v)})" for c, v in items[:10]])
         return f"Lowest-demand customers: {top}"
-
-    # 3) service level
-    if "service" in qs and "%" in qs or "service level" in qs:
+    # service level
+    if "service level" in qs or ("service" in qs and "%" in qs):
         svc = kpis.get("service_pct")
         total = kpis.get("total_demand")
         served = kpis.get("served")
@@ -259,58 +251,47 @@ def grounded_answer(q: str, dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], 
             else:
                 svc = 0.0
         return f"Service level: {svc}% (served {int(served or 0)} of {int(total or 0)})."
-
-    # 4) top flows or top lanes
+    # top flows/lanes
     if any(t in qs for t in ["top flows", "top lanes", "largest flows"]):
         flows = (diag or {}).get("flows", [])
-        if not flows:
-            return "No flows available."
+        if not flows: return "No flows available."
         rows = sorted([(f.get("warehouse"), f.get("customer"), f.get("product"), float(f.get("qty", 0) or 0)) for f in flows],
                       key=lambda x: -x[3])[:10]
         txt = "; ".join([f"{w}→{c} {p}:{int(q)}" for w,c,p,q in rows])
         return f"Top flows: {txt}"
-
-    # 5) lowest throughput warehouse (by outbound qty)
+    # lowest throughput warehouses
     if any(t in qs for t in ["lowest throughput", "least throughput", "lowest outbound"]):
         flows = (diag or {}).get("flows", [])
         tot_by_w = {}
         for f in flows:
             tot_by_w[f.get("warehouse")] = tot_by_w.get(f.get("warehouse"), 0.0) + float(f.get("qty", 0) or 0)
-        if not tot_by_w:
-            return "No flows available to compute throughput."
+        if not tot_by_w: return "No flows available to compute throughput."
         rows = sorted(tot_by_w.items(), key=lambda x: (x[1], str(x[0])))[:5]
         txt = ", ".join([f"{w}:{int(v)}" for w,v in rows])
         return f"Lowest outbound throughput warehouses: {txt}"
-
-    return ""  # not recognized; caller can escalate to LLM
+    return ""  # unknown → caller may escalate to LLM
 
 def build_llm_context(dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
-    """Compact, bounded context for LLM to avoid hallucinations."""
     dem = _demand_by_customer(dfs, period)
-    srv = _served_by_customer(diag)
-    # Build small tables (capped) to keep prompt short
+    _, unserved_list = _unserved_customers(dfs, diag, period)
     least = sorted([(c, v) for c, v in dem.items()], key=lambda x: (x[1], x[0]))[:20]
-    unserved_cnt, unserved_list = _unserved_customers(dfs, diag, period)
-    unserved_top = unserved_list[:20]
-
     def fmt_rows(rows): return "\n".join([f"- {c}: {int(v)}" for c, v in rows]) if rows else "- (none)"
-
-    lines = []
-    lines.append(f"Period: {period}")
-    lines.append(f"KPIs: status={kpis.get('status')}, total_demand={int(kpis.get('total_demand') or 0)}, served={int(kpis.get('served') or 0)}, service_pct={kpis.get('service_pct')}")
-    lines.append("Least-demand customers (up to 20):")
-    lines.append(fmt_rows(least))
-    lines.append(f"Unserved customers: count={unserved_cnt} (top up to 20):")
-    lines.append(fmt_rows(unserved_top))
-    # include products list (from Customer Product Data)
     cpd = dfs.get("Customer Product Data", pd.DataFrame())
     prods = []
     if isinstance(cpd, pd.DataFrame) and "Product" in cpd.columns:
         prods = sorted(set(cpd["Product"].dropna().astype(str).tolist()))
-    lines.append(f"Products: {', '.join(prods[:20])}" + ("" if len(prods) <= 20 else ", ..."))
+    lines = [
+        f"Period: {period}",
+        f"KPIs: status={kpis.get('status')}, total_demand={int(kpis.get('total_demand') or 0)}, served={int(kpis.get('served') or 0)}, service_pct={kpis.get('service_pct')}",
+        "Least-demand customers (up to 20):",
+        fmt_rows(least),
+        "Unserved customers (up to 20):",
+        fmt_rows(unserved_list[:20]),
+        f"Products: {', '.join(prods[:20])}" + ("" if len(prods) <= 20 else ", ..."),
+    ]
     return "\n".join(lines)
 
-# Static examples
+# ------------- Suggested prompts -------------
 STATIC_EXAMPLES = [
     "run the base model",
     "Increase demand at a specific customer by 10% and set lead time to 8",
@@ -326,7 +307,244 @@ user_prompt_default = st.session_state.get("user_prompt","")
 if "prefill_prompt" in st.session_state:
     user_prompt_default = st.session_state.pop("prefill_prompt", user_prompt_default)
 
-# ------------------ MAIN ------------------
+# ---------------- Results renderer (sticky across reruns) ----------------
+def render_results(dfs: Dict[str, pd.DataFrame],
+                   kpis: Dict[str, Any],
+                   diag: Dict[str, Any],
+                   period: int,
+                   scenario: Dict[str, Any] = None,
+                   user_prompt: str = "",
+                   before_after: Dict[str, Dict[str, pd.DataFrame]] = None):
+    """Render KPIs → Diagnostics → Map → Ask GENIE → Preview/Delta → Export; survives widget reruns."""
+    # KPIs & Summary
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📊 KPIs"); st.write(kpis)
+    with c2:
+        st.subheader("📝 Executive Summary")
+        if build_summary:
+            st.markdown(build_summary(user_prompt or "", scenario or {}, kpis, diag))
+        else:
+            st.info("reporter.build_summary missing.")
+
+    # Diagnostics
+    st.subheader("🧪 Flow Diagnostics")
+    try:
+        tc = dfs.get("Transport Cost", pd.DataFrame())
+        lanes_period = 0
+        if isinstance(tc, pd.DataFrame) and not tc.empty:
+            tcf = tc.copy()
+            try: tcf = tcf[tcf["Period"] == period]
+            except Exception: pass
+            if "Available" in tcf.columns: tcf = tcf[tcf["Available"].fillna(1) != 0]
+            if "Cost Per UOM" in tcf.columns: tcf = tcf[pd.to_numeric(tcf["Cost Per UOM"], errors="coerce").fillna(0) >= 0]
+            lanes_period = len(tcf)
+        arcs_considered = (diag or {}).get("num_arcs", None)
+        flows = (diag or {}).get("flows", [])
+        flows_count = len(flows) if isinstance(flows, list) else 0
+        geocoded = 0
+        arcs_df = pd.DataFrame()
+        if flows_to_geo and isinstance(flows, list):
+            try:
+                arcs_df = flows_to_geo(flows, dfs); geocoded = len(arcs_df) if isinstance(arcs_df, pd.DataFrame) else 0
+            except Exception: geocoded = 0
+        st.write({"period": period, "lanes_in_transport_cost": lanes_period, "optimizer_arcs_considered": arcs_considered, "flows_returned": flows_count, "flows_geocoded_for_map": geocoded})
+        if (kpis or {}).get("status") in {"no_feasible_arcs","no_demand","no_positive_demand"}:
+            st.warning("No flows because the optimizer couldn't route demand. Check lanes, demand > 0, and warehouse capacity/availability.")
+        elif flows_count > 0 and geocoded == 0:
+            st.warning("Flows exist but none were plotted. Add a 'Locations' sheet with `Location, Latitude, Longitude` for Warehouse.Location and Customer names.")
+    except Exception as e:
+        st.info(f"Diagnostics unavailable: {e}")
+
+    # Map with flows (thin + color by product + legend)
+    st.subheader("🌍 Network Map (With Flows)")
+    if pdk and build_nodes and flows_to_geo and guess_map_center:
+        try:
+            nodes_df = build_nodes(dfs)
+            flow_list = (diag or {}).get("flows", [])
+            arcs_df = flows_to_geo(flow_list, dfs)
+
+            if nodes_df.empty:
+                st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
+            else:
+                lat0, lon0 = guess_map_center(nodes_df)
+                wh = nodes_df[nodes_df["type"]=="warehouse"]; cu = nodes_df[nodes_df["type"]=="customer"]
+                layers=[]
+                if not wh.empty:
+                    layers.append(
+                        pdk.Layer("ScatterplotLayer", data=wh, get_position='[lon, lat]', get_radius=45000,
+                                  pickable=True, filled=True, get_fill_color=[30,136,229])
+                    )
+                if not cu.empty:
+                    layers.append(
+                        pdk.Layer("ScatterplotLayer", data=cu, get_position='[lon, lat]', get_radius=30000,
+                                  pickable=True, filled=True, get_fill_color=[76,175,80])
+                    )
+
+                if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
+                    arcs_df = arcs_df[arcs_df["qty"] > 1e-9].copy()
+                    if not arcs_df.empty:
+                        qmax = float(arcs_df["qty"].max())
+                        arcs_df["width"] = 1.0 if qmax <= 0 else (1.0 + 5.0 * (arcs_df["qty"] / qmax).clip(0, 1))
+
+                        base_palette = [
+                            (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48), (145, 30, 180),
+                            (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 190), (0, 128, 128),
+                        ]
+                        prod_colors = {}
+                        def color_for(prod: str):
+                            if prod in prod_colors: return prod_colors[prod]
+                            if len(prod_colors) < len(base_palette):
+                                prod_colors[prod] = base_palette[len(prod_colors)]
+                            else:
+                                import colorsys
+                                h = abs(hash(prod)) % 360
+                                r, g, b = colorsys.hsv_to_rgb(h/360.0, 0.7, 1.0)
+                                prod_colors[prod] = (int(r*255), int(g*255), int(b*255))
+                            return prod_colors[prod]
+
+                        arcs_df["rgb"] = arcs_df["product"].fillna("Unknown").map(color_for)
+                        arcs_df["color"] = arcs_df["rgb"].apply(lambda t: [int(t[0]), int(t[1]), int(t[2])])
+
+                        layers.append(
+                            pdk.Layer(
+                                "ArcLayer",
+                                data=arcs_df,
+                                get_source_position='[from_lon, from_lat]',
+                                get_target_position='[to_lon, to_lat]',
+                                get_width='width',
+                                get_source_color='color',
+                                get_target_color='color',
+                                pickable=True,
+                            )
+                        )
+
+                deck = pdk.Deck(
+                    initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.3),
+                    layers=layers,
+                    tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/><i>{product}</i>: {qty}", "style":{"color":"white"}},
+                    map_style="dark",
+                )
+                st.pydeck_chart(deck)
+
+                # Legend
+                try:
+                    if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
+                        legend_rows = (
+                            arcs_df[["product", "color"]]
+                            .drop_duplicates()
+                            .sort_values("product")
+                            .values.tolist()
+                        )
+                        if legend_rows:
+                            html = "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
+                            for prod, col in legend_rows:
+                                r, g, b = col
+                                html += (
+                                    "<div style='display:flex;align-items:center;gap:6px; margin:2px 6px;'>"
+                                    f"<span style='display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:2px;'></span>"
+                                    f"<span style='font-size:12px;'>{prod}</span></div>"
+                                )
+                            html += "</div>"
+                            st.markdown(html, unsafe_allow_html=True)
+                except Exception:
+                    pass
+
+                if (diag or {}).get("flows", []) and (arcs_df is None or arcs_df.empty):
+                    st.warning("Flows exist but none were plotted. Ensure warehouse/customer names resolve to coordinates (Locations sheet or known city names).")
+        except Exception as e:
+            st.warning(f"Map rendering skipped: {e}")
+    else:
+        st.info("pydeck not available or geo module missing; skipping map.")
+
+    # ---- Ask GENIE (immediately under map) ----
+    st.subheader("💬 Ask GENIE about results")
+    qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
+    with st.form("qa_form", clear_on_submit=False):
+        q = st.text_input("Ask things like: 'Which warehouse has the lowest throughput?' 'How many customers are unserved?' 'Lowest-demand customers?'", key="qa_text")
+        submit_qa = st.form_submit_button("Ask")
+    if submit_qa:
+        # Always try grounded first for known intents
+        ans = grounded_answer(q, dfs, kpis, diag, period=period)
+
+        # If LLM selected or not recognized, escalate with bounded context
+        use_llm = (qa_mode.startswith("Gemini") or qa_mode.startswith("OpenAI")) and (answer_question is not None)
+        if (not ans) and use_llm:
+            context = build_llm_context(dfs, kpis, diag, period=period)
+            prov = "gemini" if qa_mode.startswith("Gemini") else "openai"
+            q2 = f"Use ONLY this context to answer:\n{context}\n\nQuestion: {q}\nAnswer briefly and numerically when possible."
+            try:
+                ans = answer_question(q2, kpis, diag, provider=prov, dfs=dfs, force_llm=True)
+            except Exception as e:
+                ans = f"(LLM error; fallback) {grounded_answer(q, dfs, kpis, diag, period=period) or 'Sorry, I could not answer that.'}"
+        if not ans:
+            ans = "Sorry, I couldn't interpret that. Try asking about service %, unserved customers, lowest-demand customers, top flows, or lowest throughput warehouses."
+        st.markdown(f"**Answer**: {ans}")
+
+    # ---- Before/After preview + Delta (only when user actually edited) ----
+    if before_after:
+        # Quick preview
+        st.subheader("📋 Before vs After (Quick Preview)")
+        b = before_after.get("before", {})
+        a = before_after.get("after", {})
+        tabs = st.tabs(["Customers","Customer Product Data","Warehouse","Supplier Product","Transport Cost"])
+        with tabs[0]:
+            cA, cB = st.columns(2)
+            with cA: st.markdown("**Before**"); st.dataframe(b.get("Customers", pd.DataFrame()).head(25), use_container_width=True)
+            with cB: st.markdown("**After**");  st.dataframe(a.get("Customers", pd.DataFrame()).head(25), use_container_width=True)
+        with tabs[1]:
+            cA, cB = st.columns(2)
+            with cA: st.markdown("**Before**"); st.dataframe(b.get("Customer Product Data", pd.DataFrame()).head(25), use_container_width=True)
+            with cB: st.markdown("**After**");  st.dataframe(a.get("Customer Product Data", pd.DataFrame()).head(25), use_container_width=True)
+        with tabs[2]:
+            cA, cB = st.columns(2)
+            with cA: st.markdown("**Before**"); st.dataframe(b.get("Warehouse", pd.DataFrame()).head(25), use_container_width=True)
+            with cB: st.markdown("**After**");  st.dataframe(a.get("Warehouse", pd.DataFrame()).head(25), use_container_width=True)
+        with tabs[3]:
+            cA, cB = st.columns(2)
+            with cA: st.markdown("**Before**"); st.dataframe(b.get("Supplier Product", pd.DataFrame()).head(25), use_container_width=True)
+            with cB: st.markdown("**After**");  st.dataframe(a.get("Supplier Product", pd.DataFrame()).head(25), use_container_width=True)
+        with tabs[4]:
+            cA, cB = st.columns(2)
+            with cA: st.markdown("**Before**"); st.dataframe(b.get("Transport Cost", pd.DataFrame()).head(25), use_container_width=True)
+            with cB: st.markdown("**After**");  st.dataframe(a.get("Transport Cost", pd.DataFrame()).head(25), use_container_width=True)
+
+        # Delta tables shown only if user made edits (base model → skip)
+        user_change_count = before_after.get("user_change_count", 0)
+        if user_change_count > 0:
+            st.subheader("Δ Delta Views (Changes Only)")
+            show_delta("Customers", b.get("Customers", pd.DataFrame()), a.get("Customers", pd.DataFrame()), ["Customer","Location"])
+            show_delta("Customer Product Data", b.get("Customer Product Data", pd.DataFrame()), a.get("Customer Product Data", pd.DataFrame()), ["Product","Customer","Location","Period"])
+            bw, aw = b.get("Warehouse", pd.DataFrame()), a.get("Warehouse", pd.DataFrame())
+            if isinstance(aw, pd.DataFrame) and not aw.empty:
+                wh_keys = ["Warehouse"] + (["Period"] if "Period" in aw.columns and "Period" in bw.columns else [])
+                show_delta("Warehouse", bw, aw, wh_keys)
+            show_delta("Supplier Product", b.get("Supplier Product", pd.DataFrame()), a.get("Supplier Product", pd.DataFrame()), ["Product","Supplier","Location","Period"])
+            show_delta("Transport Cost", b.get("Transport Cost", pd.DataFrame()), a.get("Transport Cost", pd.DataFrame()), ["Mode of Transport","Product","From Location","To Location","Period"])
+        else:
+            st.info("No user edits detected (base model). Skipping delta tables.")
+
+    # Export current scenario sheets
+    st.subheader("💾 Export")
+    try:
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            for name, df in dfs.items():
+                if isinstance(df, pd.DataFrame):
+                    sname = str(name)[:31] or "Sheet"
+                    df.to_excel(w, sheet_name=sname, index=False)
+        st.download_button(
+            "Download Updated Scenario Excel",
+            data=buf.getvalue(),
+            file_name="genie_updated_scenario.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except Exception as e:
+        st.warning(f"Creating the Excel download failed: {e}")
+
+# ----------------------- Main page flow -----------------------
+uploaded = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
+
 if uploaded:
     # Load + validate
     try:
@@ -538,7 +756,6 @@ if uploaded:
                     st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Warehouse", []).append({"Warehouse": w})
                     st.success(f"Queued: delete warehouse {w}")
 
-        # View queued manual scenario JSON
         queued = st.session_state.get("manual_scenario")
         if queued:
             st.markdown("**Queued Manual Scenario (will be merged with Prompt scenario)**")
@@ -582,7 +799,7 @@ if uploaded:
 
     # ---------------- Process scenario (Prompt + Manual) ----------------
     if go and (user_prompt or "").strip():
-        # 1) Parse prompt
+        # 1) Parse
         try:
             if user_prompt.strip().lower() in {"run the base model","run base model"}:
                 prompt_scn = {"period": 2023}
@@ -596,7 +813,7 @@ if uploaded:
         except Exception as e:
             st.error(f"❌ Parsing failed: {e}"); st.stop()
 
-        # 2) Merge Manual Edits (if any)
+        # 2) Merge Manual Edits
         manual = st.session_state.get("manual_scenario", {})
         scenario = {}
         scenario["period"] = (manual.get("period") or prompt_scn.get("period") or 2023)
@@ -631,7 +848,7 @@ if uploaded:
         b_tc  = dfs.get("Transport Cost", pd.DataFrame()).copy()
         b_cu  = dfs.get("Customers", pd.DataFrame()).copy()
 
-        # 5) Apply scenario
+        # 5) Apply
         try:
             newdfs = apply_scenario(dfs, scenario, allow_delete=allow_delete)
         except Exception as e:
@@ -643,7 +860,7 @@ if uploaded:
         a_tc  = newdfs.get("Transport Cost", pd.DataFrame()).copy()
         a_cu  = newdfs.get("Customers", pd.DataFrame()).copy()
 
-        # 6) Auto-connect missing lanes (optional; does NOT count as "user change" for delta visibility)
+        # 6) Auto-connect (doesn't count as "user edits" for delta visibility)
         auto = st.checkbox("🔗 Auto-create missing lanes for feasibility (demo)", value=True)
         auto_created = 0
         if auto:
@@ -654,203 +871,15 @@ if uploaded:
         if run_optimizer is None: st.error("Optimizer module missing."); st.stop()
         kpis, diag = run_optimizer(newdfs, period=scenario.get("period", 2023))
 
-        # Persist latest results so Q&A won’t reset on reruns
-        st.session_state["last_newdfs"] = newdfs
-        st.session_state["last_kpis"]   = kpis
-        st.session_state["last_diag"]   = diag
-        st.session_state["last_period"] = scenario.get("period", 2023)
+        # Persist every piece needed for sticky results
+        st.session_state["last_newdfs"]  = newdfs
+        st.session_state["last_kpis"]    = kpis
+        st.session_state["last_diag"]    = diag
+        st.session_state["last_period"]  = scenario.get("period", 2023)
+        st.session_state["last_prompt"]  = user_prompt
+        st.session_state["last_scenario"]= scenario
 
-        # 8) KPIs & Summary
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("📊 KPIs"); st.write(kpis)
-        with c2:
-            st.subheader("📝 Executive Summary")
-            if build_summary: st.markdown(build_summary(user_prompt, scenario, kpis, diag))
-            else: st.info("reporter.build_summary missing.")
-
-        # 9) Flow Diagnostics
-        st.subheader("🧪 Flow Diagnostics")
-        try:
-            period = scenario.get("period", 2023)
-            tc = newdfs.get("Transport Cost", pd.DataFrame())
-            lanes_period = 0
-            if isinstance(tc, pd.DataFrame) and not tc.empty:
-                tcf = tc.copy()
-                try: tcf = tcf[tcf["Period"] == period]
-                except Exception: pass
-                if "Available" in tcf.columns: tcf = tcf[tcf["Available"].fillna(1) != 0]
-                if "Cost Per UOM" in tcf.columns: tcf = tcf[pd.to_numeric(tcf["Cost Per UOM"], errors="coerce").fillna(0) >= 0]
-                lanes_period = len(tcf)
-            arcs_considered = (diag or {}).get("num_arcs", None)
-            flows = (diag or {}).get("flows", [])
-            flows_count = len(flows) if isinstance(flows, list) else 0
-            geocoded = 0
-            arcs_df = pd.DataFrame()
-            if flows_to_geo and isinstance(flows, list):
-                try:
-                    arcs_df = flows_to_geo(flows, newdfs); geocoded = len(arcs_df) if isinstance(arcs_df, pd.DataFrame) else 0
-                except Exception: geocoded = 0
-            st.write({"period": period, "lanes_in_transport_cost": lanes_period, "optimizer_arcs_considered": arcs_considered, "flows_returned": flows_count, "flows_geocoded_for_map": geocoded})
-            if (kpis or {}).get("status") in {"no_feasible_arcs","no_demand","no_positive_demand"}:
-                st.warning("No flows because the optimizer couldn't route demand. Check lanes, demand > 0, and warehouse capacity/availability.")
-            elif flows_count > 0 and geocoded == 0:
-                st.warning("Flows exist but none were plotted. Add a 'Locations' sheet with `Location, Latitude, Longitude` for Warehouse.Location and Customer names.")
-        except Exception as e:
-            st.info(f"Diagnostics unavailable: {e}")
-
-        # 10) Map with flows (thin lines + color by product + legend)
-        st.subheader("🌍 Network Map (With Flows)")
-        if pdk and build_nodes and flows_to_geo and guess_map_center:
-            try:
-                nodes_df = build_nodes(newdfs)
-                flow_list = (diag or {}).get("flows", [])
-                arcs_df = flows_to_geo(flow_list, newdfs)
-
-                if nodes_df.empty:
-                    st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
-                else:
-                    lat0, lon0 = guess_map_center(nodes_df)
-                    wh = nodes_df[nodes_df["type"]=="warehouse"]; cu = nodes_df[nodes_df["type"]=="customer"]
-                    layers=[]
-                    if not wh.empty:
-                        layers.append(
-                            pdk.Layer(
-                                "ScatterplotLayer",
-                                data=wh, get_position='[lon, lat]',
-                                get_radius=45000, pickable=True, filled=True,
-                                get_fill_color=[30,136,229],
-                            )
-                        )
-                    if not cu.empty:
-                        layers.append(
-                            pdk.Layer(
-                                "ScatterplotLayer",
-                                data=cu, get_position='[lon, lat]',
-                                get_radius=30000, pickable=True, filled=True,
-                                get_fill_color=[76,175,80],
-                            )
-                        )
-
-                    if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
-                        arcs_df = arcs_df[arcs_df["qty"] > 1e-9].copy()
-                        if not arcs_df.empty:
-                            qmax = float(arcs_df["qty"].max())
-                            arcs_df["width"] = 1.0 if qmax <= 0 else (1.0 + 5.0 * (arcs_df["qty"] / qmax).clip(0, 1))
-
-                            base_palette = [
-                                (230, 25, 75),   # red
-                                (60, 180, 75),   # green
-                                (0, 130, 200),   # blue
-                                (245, 130, 48),  # orange
-                                (145, 30, 180),  # purple
-                                (70, 240, 240),  # cyan
-                                (240, 50, 230),  # magenta
-                                (210, 245, 60),  # lime
-                                (250, 190, 190), # pink
-                                (0, 128, 128),   # teal
-                            ]
-                            prod_colors = {}
-
-                            def color_for(prod: str):
-                                if prod in prod_colors:
-                                    return prod_colors[prod]
-                                if len(prod_colors) < len(base_palette):
-                                    prod_colors[prod] = base_palette[len(prod_colors)]
-                                else:
-                                    # stable hash → HSV → RGB
-                                    h = abs(hash(prod)) % 360
-                                    import colorsys
-                                    r, g, b = colorsys.hsv_to_rgb(h/360.0, 0.7, 1.0)
-                                    prod_colors[prod] = (int(r*255), int(g*255), int(b*255))
-                                return prod_colors[prod]
-
-                            arcs_df["rgb"] = arcs_df["product"].fillna("Unknown").map(color_for)
-                            arcs_df["color"] = arcs_df["rgb"].apply(lambda t: [int(t[0]), int(t[1]), int(t[2])])
-
-                            layers.append(
-                                pdk.Layer(
-                                    "ArcLayer",
-                                    data=arcs_df,
-                                    get_source_position='[from_lon, from_lat]',
-                                    get_target_position='[to_lon, to_lat]',
-                                    get_width='width',
-                                    get_source_color='color',
-                                    get_target_color='color',
-                                    pickable=True,
-                                )
-                            )
-
-                    deck = pdk.Deck(
-                        initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.3),
-                        layers=layers,
-                        tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/><i>{product}</i>: {qty}", "style":{"color":"white"}},
-                        map_style="dark",
-                    )
-                    st.pydeck_chart(deck)
-
-                    # Legend
-                    try:
-                        if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
-                            legend_rows = (
-                                arcs_df[["product", "color"]]
-                                .drop_duplicates()
-                                .sort_values("product")
-                                .values.tolist()
-                            )
-                            if legend_rows:
-                                html = "<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;'>"
-                                for prod, col in legend_rows:
-                                    r, g, b = col
-                                    html += (
-                                        "<div style='display:flex;align-items:center;gap:6px; margin:2px 6px;'>"
-                                        f"<span style='display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:2px;'></span>"
-                                        f"<span style='font-size:12px;'>{prod}</span></div>"
-                                    )
-                                html += "</div>"
-                                st.markdown(html, unsafe_allow_html=True)
-                    except Exception:
-                        pass
-
-                    if (diag or {}).get("flows", []) and (arcs_df is None or arcs_df.empty):
-                        st.warning("Flows exist but none were plotted. Ensure warehouse/customer names resolve to coordinates (Locations sheet or known city names).")
-            except Exception as e:
-                st.warning(f"Map rendering skipped: {e}")
-        else:
-            st.info("pydeck not available or geo module missing; skipping map.")
-
-        # 10.5) 💬 Ask GENIE — moved right under the solved map (uses session_state, grounded + LLM with context)
-        st.subheader("💬 Ask GENIE about results")
-        qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
-        with st.form("qa_form", clear_on_submit=False):
-            q = st.text_input("Ask things like: 'Which warehouse has the lowest throughput?' 'How many customers are unserved?' 'Lowest-demand customers?'", key="qa_text")
-            submit_qa = st.form_submit_button("Ask")
-        if submit_qa:
-            last_kpis = st.session_state.get("last_kpis", kpis)
-            last_diag = st.session_state.get("last_diag", diag)
-            last_dfs  = st.session_state.get("last_newdfs", newdfs)
-            last_period = st.session_state.get("last_period", scenario.get("period", 2023))
-
-            # Always try grounded first for recognized intents
-            ans = grounded_answer(q, last_dfs, last_kpis, last_diag, period=last_period)
-
-            # If user requested LLM or grounded didn't recognize, escalate with strict context
-            use_llm = (qa_mode.startswith("Gemini") or qa_mode.startswith("OpenAI")) and (parse_with_llm or answer_question)
-            if (not ans) and use_llm and (answer_question is not None):
-                context = build_llm_context(last_dfs, last_kpis, last_diag, period=last_period)
-                prov = "gemini" if qa_mode.startswith("Gemini") else "openai"
-                # Prefix question with bounded context to reduce hallucinations
-                q2 = f"Use ONLY this context to answer:\n{context}\n\nQuestion: {q}\nAnswer briefly and numerically when possible."
-                try:
-                    ans = answer_question(q2, last_kpis, last_diag, provider=prov, dfs=last_dfs, force_llm=True)
-                except Exception as e:
-                    ans = f"(LLM error; falling back) {grounded_answer(q, last_dfs, last_kpis, last_diag, period=last_period) or 'Sorry, I could not answer that.'}"
-
-            if not ans:
-                ans = "Sorry, I couldn't interpret that. Try asking about service %, unserved customers, lowest-demand customers, top flows, or lowest throughput warehouses."
-            st.markdown(f"**Answer**: {ans}")
-
-        # 11) Before/After + Δ (SHOW ONLY IF USER MADE CHANGES)
+        # Track before/after for delta (only if user made edits)
         user_change_count = 0
         for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
             user_change_count += len(scenario.get(k, []) or [])
@@ -858,62 +887,34 @@ if uploaded:
             user_change_count += sum(len(v) for v in scenario["adds"].values())
         if isinstance(scenario.get("deletes"), dict):
             user_change_count += sum(len(v) for v in scenario["deletes"].values())
-        show_deltas = user_change_count > 0  # do not count autoconnect
+        st.session_state["last_before_after"] = {
+            "before": {
+                "Customer Product Data": b_cpd, "Warehouse": b_wh, "Supplier Product": b_sp, "Transport Cost": b_tc, "Customers": b_cu
+            },
+            "after": {
+                "Customer Product Data": a_cpd, "Warehouse": a_wh, "Supplier Product": a_sp, "Transport Cost": a_tc, "Customers": a_cu
+            },
+            "user_change_count": user_change_count
+        }
 
-        st.subheader("📋 Before vs After (Quick Preview)")
-        tabs = st.tabs(["Customers","Customer Product Data","Warehouse","Supplier Product","Transport Cost"])
-        with tabs[0]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b_cu.head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a_cu.head(25), use_container_width=True)
-        with tabs[1]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b_cpd.head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a_cpd.head(25), use_container_width=True)
-        with tabs[2]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b_wh.head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a_wh.head(25), use_container_width=True)
-        with tabs[3]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b_sp.head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a_sp.head(25), use_container_width=True)
-        with tabs[4]:
-            cA, cB = st.columns(2)
-            with cA: st.markdown("**Before**"); st.dataframe(b_tc.head(25), use_container_width=True)
-            with cB: st.markdown("**After**");  st.dataframe(a_tc.head(25), use_container_width=True)
+        # Render results now
+        render_results(
+            dfs=newdfs, kpis=kpis, diag=diag, period=scenario.get("period", 2023),
+            scenario=scenario, user_prompt=user_prompt,
+            before_after=st.session_state["last_before_after"]
+        )
 
-        if show_deltas:
-            st.subheader("Δ Delta Views (Changes Only)")
-            show_delta("Customers", b_cu, a_cu, ["Customer","Location"])
-            show_delta("Customer Product Data", b_cpd, a_cpd, ["Product","Customer","Location","Period"])
-            if isinstance(a_wh, pd.DataFrame) and not a_wh.empty:
-                wh_keys = ["Warehouse"] + (["Period"] if "Period" in a_wh.columns and "Period" in b_wh.columns else [])
-                show_delta("Warehouse", b_wh, a_wh, wh_keys)
-            if isinstance(a_sp, pd.DataFrame) and not a_sp.empty:
-                show_delta("Supplier Product", b_sp, a_sp, ["Product","Supplier","Location","Period"])
-            if isinstance(a_tc, pd.DataFrame) and not a_tc.empty:
-                show_delta("Transport Cost", b_tc, a_tc, ["Mode of Transport","Product","From Location","To Location","Period"])
-        else:
-            st.info("No user edits detected (base model). Skipping delta tables.")
-
-        # 12) Export
-        st.subheader("💾 Export")
-        try:
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                for name, df in newdfs.items():
-                    if isinstance(df, pd.DataFrame):
-                        sname = str(name)[:31] or "Sheet"
-                        df.to_excel(w, sheet_name=sname, index=False)
-            st.download_button(
-                "Download Updated Scenario Excel",
-                data=buf.getvalue(),
-                file_name="genie_updated_scenario.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        except Exception as e:
-            st.warning(f"Creating the Excel download failed: {e}")
+    # --- Sticky results view (so changing Gemini/OpenAI radio won't reset the page) ---
+    elif st.session_state.get("last_newdfs") is not None and st.session_state.get("last_kpis") is not None:
+        render_results(
+            dfs=st.session_state["last_newdfs"],
+            kpis=st.session_state["last_kpis"],
+            diag=st.session_state["last_diag"],
+            period=st.session_state.get("last_period", 2023),
+            scenario=st.session_state.get("last_scenario", {}),
+            user_prompt=st.session_state.get("last_prompt", ""),
+            before_after=st.session_state.get("last_before_after", None)
+        )
 
 else:
     st.info("Upload your base case to begin. Or download a sample template:")
