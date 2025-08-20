@@ -1,9 +1,9 @@
 # app.py — GENIE: Supply Chain Network Designer
-# Upload → Validate → Nodes map → Scenario (Rules/LLM) → Apply edits → Optimize → KPIs + Flow map → Q&A → Download
+# Upload → Validate → Nodes map → Scenario (Rules/LLM) → Apply edits → Optimize
+# → KPIs + Flow map → Q&A → Download
+
 from __future__ import annotations
-import os
-import io
-import json
+import os, io, json
 from typing import Dict, Any, List, Tuple
 
 import pandas as pd
@@ -75,11 +75,11 @@ except ModuleNotFoundError:
     missing_engine.append("engine/genai.py (parse_with_llm, answer_question, suggest_location_candidates)")
 
 try:
-    from engine.examples import rules_examples, llm_examples
+    from example_gen import rules_examples, llm_examples
 except ModuleNotFoundError:
     rules_examples = None  # type: ignore
     llm_examples = None  # type: ignore
-    missing_engine.append("engine/examples.py (rules_examples, llm_examples)")
+    missing_engine.append("example_gen.py (rules_examples, llm_examples)")
 
 # ------------------------------ Helpers ------------------------------
 def _downloadable_excel(dfs: Dict[str, pd.DataFrame], filename: str = "scenario.xlsx") -> Tuple[bytes, str]:
@@ -104,7 +104,7 @@ def _arc_layer_from_flows_geo(geo_df: pd.DataFrame):
     if geo_df is None or geo_df.empty:
         return None
     q = geo_df["qty"].astype(float).clip(lower=0.0).fillna(0.0)
-    width = (1.0 + np.sqrt(q) * 0.5).tolist()  # thin lines, gently scaled
+    width = (1.0 + np.sqrt(q) * 0.5).tolist()  # thin lines
     colors = []
     for _, r in geo_df.iterrows():
         colors.append(_thin_color_for_product(str(r.get("product", ""))) + [180])
@@ -249,7 +249,7 @@ if uploaded is not None:
         lat, lon = guess_map_center(nodes_df)
         layers = _scatter_layers_from_nodes(nodes_df)
         st.pydeck_chart(pdk.Deck(
-            map_style="mapbox://styles/mapbox/light-v9",
+            map_style=None,  # avoid mapbox token issues
             initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=3.5),
             layers=layers,
             tooltip={"text": "{name} ({type})\n{location}"}
@@ -269,19 +269,17 @@ if ss.get("pending_prompt"):
 left, right = st.columns([2, 1])
 
 with left:
-    # Dynamic examples from the uploaded file (no hard-coded products)
     st.markdown("**Insert an example from your file**")
     dyn_rules = rules_examples(ss["dfs"]) if rules_examples else []
     ex_choice = st.selectbox("Examples (dynamic)", ["(choose one)"] + dyn_rules, index=0, key="ex_choice_rules")
     if st.button("Insert example"):
         if ex_choice and ex_choice != "(choose one)":
-            # Set pending so we don't mutate after widget creation
             ss["pending_prompt"] = ex_choice
             st.experimental_rerun()
 
     st.markdown("**Write prompt** (natural language)")
     user_prompt_val = ss.get("user_prompt", "")
-    user_prompt = st.text_area(
+    st.text_area(
         "Describe your what-if...",
         value=user_prompt_val,
         height=120,
@@ -301,7 +299,6 @@ if do_process:
         st.error("Please upload a workbook first.")
     else:
         dfs = ss["dfs"]
-        # Build scenario JSON
         scenario = {"period": DEFAULT_PERIOD, "demand_updates": [], "warehouse_changes": [], "supplier_changes": [], "transport_updates": []}
         text = ss.get("user_prompt", "") or ""
 
@@ -381,7 +378,7 @@ if do_process:
                 if arc_layer is not None:
                     layers2.append(arc_layer)
                 st.pydeck_chart(pdk.Deck(
-                    map_style="mapbox://styles/mapbox/light-v9",
+                    map_style=None,  # avoid token
                     initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=3.5),
                     layers=layers2,
                     tooltip={"text": "{product}: {qty}\n{from} → {to}"}
@@ -452,7 +449,7 @@ with help_col2:
                 lat, lon = guess_map_center(nodes_df)
                 layers = _scatter_layers_from_nodes(nodes_df)
                 st.pydeck_chart(pdk.Deck(
-                    map_style="mapbox://styles/mapbox/light-v9",
+                    map_style=None,
                     initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=3.5),
                     layers=layers
                 ))
