@@ -75,7 +75,7 @@ except ModuleNotFoundError:
     missing_engine.append("engine/genai.py (parse_with_llm, answer_question, suggest_location_candidates)")
 
 try:
-    from example_gen import rules_examples, llm_examples
+    from engine.example_gen import rules_examples, llm_examples
 except ModuleNotFoundError:
     rules_examples = None  # type: ignore
     llm_examples = None  # type: ignore
