@@ -1,242 +1,170 @@
-# engine/optimizer.py
-# Quick single-echelon MILP: warehouse -> customer flows by product.
-# Hardened against NaNs, missing arcs/costs, force open/close, and adds an unmet-demand penalty
-# so you get a feasible solution with diagnostics instead of a hard failure.
-
 from __future__ import annotations
 from typing import Dict, Any, Tuple, List
 import pandas as pd
-import numpy as np
 import pulp
 
 DEFAULT_PERIOD = 2023
-BIG_M = 1e9  # penalty for unmet demand (per unit)
-
-def _safe_df(df) -> pd.DataFrame:
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+BIGM = 1e12
+UNMET_PENALTY = 1e6  # strong preference to serve demand when arcs exist
 
 def _num(x, default=0.0) -> float:
     try:
         v = float(x)
-        if pd.isna(v) or not np.isfinite(v):
-            return float(default)
-        return float(v)
-    except Exception:
-        return float(default)
-
-def _i(x, default=0) -> int:
-    try:
-        v = int(float(x))
+        if v != v:  # NaN
+            return default
         return v
     except Exception:
-        return int(default)
+        return default
 
 def _warehouse_capacity(row: pd.Series) -> float:
-    # Force Close overrides capacity to 0
-    if _i(row.get("Force Close", 0), 0) == 1:
+    # Force Close or Available==0 => capacity 0
+    force_close = int(_num(row.get("Force Close", 0), 0)) == 1
+    available = int(_num(row.get("Available (Warehouse)", 1), 1))  # optional column
+    if force_close or available == 0:
         return 0.0
-    cap = _num(row.get("Maximum Capacity"), 0.0)
-    if cap < 0 or not np.isfinite(cap):
-        cap = 0.0
-    return cap
+    maxcap = _num(row.get("Maximum Capacity", None), None)
+    if maxcap is None:
+        # If missing, treat as very big capacity (acts as unbounded)
+        return BIGM
+    return maxcap if maxcap >= 0 else 0.0
 
 def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Build and solve a small MILP:
-      - Vars: x[w,c,p] >= 0 (qty), u[c,p] >= 0 (unmet)
-      - Min: sum(cpu[w,c,p] * x[w,c,p]) + BIG_M * sum(u[c,p])
-      - s.t. For each (c,p): sum_w x[w,c,p] + u[c,p] = demand[c,p]
-            For each w:      sum_{c,p} x[w,c,p] <= capacity_w
-    Uses Transport Cost as the arc set (available=1, finite CPU).
-    Returns:
-      kpis: {status, total_cost, total_demand, served, service_pct, open_warehouses}
-      diag: {flows: [ {warehouse, customer, product, qty, unit_cost}... ],
-             binding_warehouses: [(w, used, cap, slack)]}
-    """
-    # --- Gather demand by customer & product for the given period ---
-    cpd = _safe_df(dfs.get("Customer Product Data"))
-    dem_rows = []
-    if not cpd.empty:
-        # ensure columns
-        for c in ["Product","Customer","Location","Period","Demand"]:
-            if c not in cpd.columns:
-                cpd[c] = np.nan
-        # only this period (or rows with missing Period treated as period)
-        cpd["_Period"] = pd.to_numeric(cpd["Period"], errors="coerce").fillna(period).astype(int)
-        sel = cpd[cpd["_Period"] == int(period)].copy()
-        sel["Demand"] = pd.to_numeric(sel["Demand"], errors="coerce").fillna(0.0)
-        for _, r in sel.iterrows():
-            prod = str(r.get("Product","") or "")
-            cust = str(r.get("Customer","") or "")
-            if not prod or not cust:
-                continue
-            dem_rows.append((cust, prod, float(r["Demand"])))
-    # collapse by (customer, product)
-    demand: Dict[Tuple[str,str], float] = {}
-    for c, p, d in dem_rows:
-        demand[(c,p)] = demand.get((c,p), 0.0) + float(d)
+    wh = dfs.get("Warehouse", pd.DataFrame()).copy()
+    cust = dfs.get("Customers", pd.DataFrame()).copy()
+    cpd = dfs.get("Customer Product Data", pd.DataFrame()).copy()
+    tc = dfs.get("Transport Cost", pd.DataFrame()).copy()
 
-    total_demand = float(sum(demand.values()))
-    # Edge case: no demand rows at all
-    if total_demand <= 0:
-        return (
-            {
-                "status": "no_demand",
-                "total_cost": 0.0,
-                "total_demand": 0,
-                "served": 0,
-                "service_pct": 100.0,
-                "open_warehouses": 0,
-            },
-            {"flows": [], "binding_warehouses": [], "num_arcs": 0}
-        )
+    if wh.empty or cust.empty or cpd.empty:
+        return {"status": "missing_input", "total_cost": None, "total_demand": 0, "served": 0, "service_pct": 0, "open_warehouses": 0}, {"flows": []}
 
-    # --- Warehouses & capacities ---
-    wh = _safe_df(dfs.get("Warehouse")).copy()
-    warehouses: List[str] = []
-    cap: Dict[str, float] = {}
-    if not wh.empty and "Warehouse" in wh.columns:
-        for _, r in wh.iterrows():
-            w = str(r.get("Warehouse",""))
-            if not w:
-                continue
-            if w in warehouses:
-                # if duplicate rows, take max capacity (simple aggregation)
-                cap[w] = max(cap.get(w, 0.0), _warehouse_capacity(r))
-            else:
-                warehouses.append(w)
-                cap[w] = _warehouse_capacity(r)
+    # Normalize
+    for df in [wh, cust, cpd, tc]:
+        df.columns = [str(c).strip() for c in df.columns]
 
-    # If no Warehouse sheet, we allow a "virtual" unlimited depot? Safer is to produce no arcs.
-    # We'll proceed with arcs; if none exist, we exit later with "no_feasible_arcs".
+    # Period filter (cpd, tc)
+    if "Period" in cpd.columns:
+        cpd = cpd[cpd["Period"].fillna(period) == period].copy()
+    else:
+        cpd["Period"] = period
+    if "Period" in tc.columns:
+        tc = tc[(tc["Period"].isna()) | (tc["Period"] == period)].copy()
 
-    # --- Arcs from Transport Cost ---
-    tc = _safe_df(dfs.get("Transport Cost")).copy()
-    arcs: Dict[Tuple[str,str,str], float] = {}  # (w,c,p) -> cpu
+    # Demand by (c,p)
+    cpd["Demand"] = pd.to_numeric(cpd.get("Demand", 0), errors="coerce").fillna(0.0)
+    demand = cpd.groupby(["Customer","Product"], as_index=False)["Demand"].sum()
+    demand = demand[demand["Demand"] > 0]
+    total_demand = float(demand["Demand"].sum())
+
+    # Warehouse data
+    wh["cap"] = wh.apply(_warehouse_capacity, axis=1)
+    wh_map = {str(r["Warehouse"]): float(r["cap"]) for _, r in wh.iterrows()}
+    wh_loc = {str(r["Warehouse"]): str(r.get("Location", r["Warehouse"])) for _, r in wh.iterrows()}
+    open_warehouses = int(sum(1 for w, cap in wh_map.items() if cap > 0))
+
+    # Customer locations
+    cust_loc = {str(r["Customer"]): str(r.get("Location", r["Customer"])) for _, r in cust.iterrows()}
+
+    # Build arcs (w,c,p) from Transport Cost rows that match From/To to either names or locations
+    arcs: Dict[Tuple[str,str,str], float] = {}
     if not tc.empty:
-        for c in ["Mode of Transport","Product","From Location","To Location","Period","Available","Cost Per UOM"]:
-            if c not in tc.columns:
-                tc[c] = np.nan
-        tc["_Period"] = pd.to_numeric(tc["Period"], errors="coerce").fillna(period).astype(int)
-        available = pd.to_numeric(tc["Available"], errors="coerce").fillna(1).astype(int)
-        same_period = (tc["_Period"] == int(period))
-        good = same_period & (available == 1)
-        sub = tc[good].copy()
-        sub["Cost Per UOM"] = pd.to_numeric(sub["Cost Per UOM"], errors="coerce")
-        sub = sub[np.isfinite(sub["Cost Per UOM"])]
-        for _, r in sub.iterrows():
-            w = str(r.get("From Location","") or "")
-            cst = str(r.get("To Location","") or "")
-            p = str(r.get("Product","") or "")
-            cpu = float(r["Cost Per UOM"])
-            if not w or not cst or not np.isfinite(cpu):
+        # Only consider Available != 0 (or missing -> available)
+        avail_col = "Available" if "Available" in tc.columns else None
+        for _, r in tc.iterrows():
+            if avail_col is not None and int(_num(r.get(avail_col, 1), 1)) == 0:
                 continue
-            # Treat From Location as warehouse name (common in your file)
-            arcs[(w, cst, p)] = cpu
+            mode = str(r.get("Mode of Transport", "")).strip()
+            prod = str(r.get("Product", "")).strip()
+            fr = str(r.get("From Location", "")).strip()
+            to = str(r.get("To Location", "")).strip()
+            cost = _num(r.get("Cost Per UOM", 0.0), 0.0)
+            # match warehouse by name or location
+            for wname, wloc in wh_loc.items():
+                if fr == wname or fr == wloc:
+                    # match customer by name or location
+                    for cname, cloc in cust_loc.items():
+                        if to == cname or to == cloc:
+                            arcs[(wname, cname, prod)] = float(cost)
 
+    # If no arcs at all, still build a model with unmet flows to explain infeasibility
     if not arcs:
-        # Without arcs, we cannot route; report diagnostics.
-        return (
-            {
-                "status": "no_feasible_arcs",
-                "total_cost": None,
-                "total_demand": int(total_demand),
-                "served": 0,
-                "service_pct": 0.0,
-                "open_warehouses": int(sum(1 for v in cap.values() if v > 0)),
-            },
-            {"flows": [], "binding_warehouses": [], "num_arcs": 0}
-        )
+        kpis = {
+            "status": "no_feasible_arcs",
+            "total_cost": None,
+            "total_demand": total_demand,
+            "served": 0,
+            "service_pct": 0,
+            "open_warehouses": open_warehouses,
+        }
+        return kpis, {"flows": [], "binding_warehouses": [], "num_arcs": 0}
 
-    # --- Build model ---
-    m = pulp.LpProblem("GenieNetworkDesign", pulp.LpMinimize)
+    # PuLP model
+    m = pulp.LpProblem("network", pulp.LpMinimize)
+    x: Dict[Tuple[str,str,str], pulp.LpVariable] = {
+        (w, c, p): pulp.LpVariable(f"x_{hash((w,c,p))}", lowBound=0)
+        for (w, c, p) in arcs.keys()
+    }
 
-    # Vars
-    x: Dict[Tuple[str,str,str], pulp.LpVariable] = {}  # (w,c,p)
-    for key in arcs.keys():
-        x[key] = pulp.LpVariable(f"x_{hash(key)}", lowBound=0, cat="Continuous")
-
-    # unmet demand vars
-    u: Dict[Tuple[str,str], pulp.LpVariable] = {}
-    for cp in demand.keys():
-        u[cp] = pulp.LpVariable(f"u_{hash(cp)}", lowBound=0, cat="Continuous")
+    # unmet demand variables
+    u: Dict[Tuple[str,str], pulp.LpVariable] = {
+        (row["Customer"], row["Product"]): pulp.LpVariable(f"u_{hash((row['Customer'],row['Product']))}", lowBound=0)
+        for _, row in demand.iterrows()
+    }
 
     # Objective
-    m += pulp.lpSum(arcs[(w,c,p)] * var for (w,c,p), var in x.items()) + BIG_M * pulp.lpSum(u.values())
+    m += pulp.lpSum(arcs[(w, c, p)] * var for (w, c, p), var in x.items()) + UNMET_PENALTY * pulp.lpSum(u.values())
 
-    # Demand constraints
-    for (cst, p), dem in demand.items():
-        # sum_w x[w,c,p] + u[c,p] = dem
-        terms = [x[(w,cst,p)] for (w, cc, pp) in x.keys() if cc == cst and pp == p and (w,cst,p) in x]
-        if terms:
-            m += pulp.lpSum(terms) + u[(cst,p)] == float(dem)
+    # Demand satisfaction
+    for _, row in demand.iterrows():
+        c = row["Customer"]; p = row["Product"]; d = float(row["Demand"])
+        m += pulp.lpSum(x[(w, c, p)] for (w, cc, pp) in x.keys() if cc == c and pp == p) + u[(c, p)] == d
+
+    # Warehouse capacity
+    for wname, cap in wh_map.items():
+        cap_safe = float(cap if cap is not None and cap == cap and cap >= 0 else 0.0)
+        if cap_safe == 0.0:
+            # Force zero outbound
+            m += pulp.lpSum(x[(ww, c, p)] for (ww, c, p) in x.keys() if ww == wname) <= 0.0
         else:
-            # No inbound arcs for this (c,p); unmet var will take the demand.
-            m += u[(cst,p)] == float(dem)
-
-    # Capacity constraints per warehouse
-    for w in warehouses:
-        cw = float(cap.get(w, 0.0))
-        terms = [x[(ww, c, p)] for (ww, c, p) in x.keys() if ww == w]
-        if terms:
-            if cw <= 0 or not np.isfinite(cw):
-                # Force zero outbound if no capacity
-                m += pulp.lpSum(terms) <= 0
-            else:
-                m += pulp.lpSum(terms) <= cw
+            m += pulp.lpSum(x[(ww, c, p)] for (ww, c, p) in x.keys() if ww == wname) <= cap_safe
 
     # Solve
     m.solve(pulp.PULP_CBC_CMD(msg=False))
-
     status = pulp.LpStatus[m.status]
+
+    # Extract flows
     flows: List[Dict[str, Any]] = []
     served = 0.0
-    total_cost = 0.0
+    for (w, c, p), var in x.items():
+        v = float(var.value() or 0.0)
+        if v > 1e-6:
+            flows.append({"warehouse": w, "customer": c, "product": p, "qty": v})
+            served += v
 
-    if status not in ("Optimal", "Feasible"):
-        # Infeasible or other status
-        return (
-            {
-                "status": status.lower(),
-                "total_cost": None,
-                "total_demand": int(total_demand),
-                "served": 0,
-                "service_pct": 0.0,
-                "open_warehouses": int(sum(1 for v in cap.values() if v > 0)),
-            },
-            {"flows": [], "binding_warehouses": [], "num_arcs": len(x)}
-        )
+    total_cost_val = None
+    try:
+        total_cost_val = float(pulp.value(m.objective))
+    except Exception:
+        total_cost_val = None
 
-    # Extract flows & KPIs
-    for (w, cst, p), var in x.items():
-        q = float(var.value() or 0.0)
-        if q > 1e-6:
-            cpu = float(arcs[(w,cst,p)])
-            flows.append({"warehouse": w, "customer": cst, "product": p, "qty": q, "unit_cost": cpu})
-            served += q
-            total_cost += cpu * q
+    service_pct = 0.0
+    if total_demand > 0:
+        service_pct = 100.0 * served / total_demand
 
-    unmet = sum(float(v.value() or 0.0) for v in u.values())
-    # Note: total_cost includes penalty inside solver, but we report only transport part here.
-    service_pct = 0.0 if total_demand <= 0 else (served / total_demand) * 100.0
-
-    # binding caps
-    binding: List[Tuple[str, float, float, float]] = []
-    for w in warehouses:
-        cw = float(cap.get(w, 0.0))
-        used = sum(q["qty"] for q in flows if q["warehouse"] == w)
-        slack = max(cw - used, 0.0)
-        # Consider "binding" if within 1% or 1 unit
-        if cw > 0 and (slack <= max(0.01 * cw, 1.0)):
-            binding.append((w, used, cw, slack))
+    # Binding warehouses
+    binding = []
+    for wname, cap in wh_map.items():
+        cap_safe = float(cap if cap is not None and cap == cap and cap >= 0 else 0.0)
+        used = sum(f["qty"] for f in flows if f["warehouse"] == wname)
+        if cap_safe > 0 and used >= 0.999 * cap_safe:
+            binding.append({"warehouse": wname, "used": used, "cap": cap_safe})
 
     kpis = {
-        "status": status.lower(),
-        "total_cost": round(total_cost, 4),
+        "status": status,
+        "total_cost": round(total_cost_val, 2) if total_cost_val is not None else None,
         "total_demand": int(total_demand),
         "served": int(round(served)),
         "service_pct": round(service_pct, 2),
-        "open_warehouses": int(sum(1 for v in cap.values() if v > 0)),
+        "open_warehouses": open_warehouses,
     }
     diag = {"flows": flows, "binding_warehouses": binding[:3], "num_arcs": len(x)}
     return kpis, diag
