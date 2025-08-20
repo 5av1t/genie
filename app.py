@@ -113,8 +113,7 @@ with st.sidebar:
         "- \"**Run the base model**\" (no edits, just optimize + map)\n"
         "- **Ask about results** (e.g., “lowest throughput warehouse”, “top lanes by flow”)"
     )
-    st.markdown("---")
-    st.caption("Configure secrets in Streamlit Cloud → App settings → Secrets. For local dev, use `.streamlit/secrets.toml`.")
+    
 
 # ========= Inputs (upload) =========
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
