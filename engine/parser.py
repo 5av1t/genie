@@ -1,231 +1,347 @@
-from typing import Dict, Any, List
+# engine/parser.py
+# Deterministic rules parser that converts plain English statements into
+# a schema-constrained scenario JSON for GENIE.
+#
+# Supported intents (case-insensitive; multiple statements separated by ';' or newlines):
+# - Increase/Decrease <Product> demand at <Customer> by <pct>% [for/in <year>]
+#   [and set Lead Time to <days>]
+# - Cap <Warehouse> Maximum Capacity at <value>
+# - Force close <Warehouse>
+# - Force open <Warehouse>
+# - Enable <Product> at <Supplier> [for/in <year>]
+# - Set <Mode of Transport> lane <From> -> <To> for <Product> to Cost Per UOM = <value> [in <year>]
+#
+# Returns scenario dict:
+# {
+#   "period": 2023,
+#   "demand_updates": [...],
+#   "warehouse_changes": [...],
+#   "supplier_changes": [...],
+#   "transport_updates": [...],
+#   "_notes": ["... skipped due to ...", ...]
+# }
+#
+from __future__ import annotations
+from typing import Dict, Any, List, Optional, Tuple
 import re
 import pandas as pd
 
 DEFAULT_PERIOD = 2023
 
-def _vals(df, col) -> List[str]:
-    if df is None or col not in df.columns:
-        return []
-    return sorted({str(x) for x in df[col].dropna().tolist()})
+# -------------------------- Utilities --------------------------
 
-def _catalog(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
-    return {
-        "products": _vals(dfs.get("Products"), "Product"),
-        "customers": _vals(dfs.get("Customers"), "Customer") or _vals(dfs.get("Customer Product Data"), "Customer"),
-        "warehouses": _vals(dfs.get("Warehouse"), "Warehouse"),
-        "suppliers": _vals(dfs.get("Supplier Product"), "Supplier"),
-        "modes": _vals(dfs.get("Mode of Transport"), "Mode of Transport"),
-        "locations": sorted(
-            set(_vals(dfs.get("Warehouse"), "Location")) |
-            set(_vals(dfs.get("Customers"), "Location")) |
-            set(_vals(dfs.get("Customer Product Data"), "Location")) |
-            set(_vals(dfs.get("Customers"), "Customer"))
-        ),
+def _safe_df(df) -> pd.DataFrame:
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def _collect_entities(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+    """Collect canonical entity names from the workbook for exact matching."""
+    ent: Dict[str, List[str]] = {
+        "products": [],
+        "warehouses": [],
+        "customers": [],
+        "suppliers": [],
+        "modes": [],
+        "locations": [],
     }
+    # Products
+    prod = _safe_df(dfs.get("Products"))
+    if "Product" in prod.columns:
+        ent["products"] = sorted(list({str(x) for x in prod["Product"].dropna().astype(str)}))
 
-def _base_scenario(period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
+    # Warehouses & their locations
+    wh = _safe_df(dfs.get("Warehouse"))
+    if "Warehouse" in wh.columns:
+        ent["warehouses"] = sorted(list({str(x) for x in wh["Warehouse"].dropna().astype(str)}))
+    if "Location" in wh.columns:
+        ent["locations"].extend([str(x) for x in wh["Location"].dropna().astype(str)])
+
+    # Customers & their locations
+    cu = _safe_df(dfs.get("Customers"))
+    if "Customer" in cu.columns:
+        ent["customers"] = sorted(list({str(x) for x in cu["Customer"].dropna().astype(str)}))
+    if "Location" in cu.columns:
+        ent["locations"].extend([str(x) for x in cu["Location"].dropna().astype(str)])
+
+    # Locations sheet (optional)
+    loc = _safe_df(dfs.get("Locations"))
+    if "Location" in loc.columns:
+        ent["locations"].extend([str(x) for x in loc["Location"].dropna().astype(str)])
+
+    # Suppliers (from Supplier Product)
+    sp = _safe_df(dfs.get("Supplier Product"))
+    if "Supplier" in sp.columns:
+        ent["suppliers"] = sorted(list({str(x) for x in sp["Supplier"].dropna().astype(str)}))
+    if "Location" in sp.columns:
+        ent["locations"].extend([str(x) for x in sp["Location"].dropna().astype(str)])
+
+    # Modes of Transport
+    mot = _safe_df(dfs.get("Mode of Transport"))
+    if "Mode of Transport" in mot.columns:
+        ent["modes"] = sorted(list({str(x) for x in mot["Mode of Transport"].dropna().astype(str)}))
+
+    # De-duplicate locations
+    ent["locations"] = sorted(list({x for x in ent["locations"] if x}))
+
+    return ent
+
+def _find_entity(text: str, candidates: List[str]) -> Optional[str]:
+    """
+    Match any candidate by case-insensitive exact substring, preferring the longest match.
+    We avoid fuzzy guesses to prevent hallucinations.
+    """
+    if not text or not candidates:
+        return None
+    t = text.lower()
+    hits: List[Tuple[int, str]] = []
+    for c in candidates:
+        cl = c.lower()
+        if cl in t:
+            hits.append((len(c), c))
+    if not hits:
+        return None
+    # prefer longest name (avoids partials like 'Paris' matching 'Paris_CDC' unexpectedly)
+    hits.sort(key=lambda x: (-x[0], x[1]))
+    return hits[0][1]
+
+def _extract_year(text: str, default_year: int) -> int:
+    m = re.search(r"\b(20\d{2})\b", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return default_year
+    return default_year
+
+def _extract_number(text: str) -> Optional[float]:
+    m = re.search(r"(-?\d+(?:\.\d+)?)", text.replace(",", ""))
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _split_statements(text: str) -> List[str]:
+    # Split on semicolons or newlines
+    parts = re.split(r"[;\n]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+# -------------------------- Intent Parsers --------------------------
+
+def _parse_demand(stmt: str, ent: Dict[str, List[str]], default_period: int) -> Optional[Dict[str, Any]]:
+    """
+    Patterns:
+      Increase <Product> demand at <Customer> by <pct>% [for 2023] [and set Lead Time to <days>]
+      Decrease <Product> demand at <Customer> by <pct>%
+    """
+    if not re.search(r"\bdemand\b", stmt, flags=re.I):
+        return None
+    if not re.search(r"\b(increase|decrease|reduce|raise)\b", stmt, flags=re.I):
+        return None
+
+    product = _find_entity(stmt, ent["products"])
+    customer = _find_entity(stmt, ent["customers"])
+    if not product or not customer:
+        return None
+
+    # location for customer: default to customer name unless CPD uses a separate Location
+    location = customer  # safe default; updater can map to CPD row by (Product, Customer, Location, Period)
+    # If uploaded Customers sheet has a distinct location, use that
+    # (We don't have direct access here; updater will handle creation if missing)
+
+    # pct
+    pct = _extract_number(stmt)
+    if pct is None:
+        return None
+    if re.search(r"\b(decrease|reduce)\b", stmt, flags=re.I):
+        pct = -abs(pct)
+    else:
+        pct = abs(pct)
+
+    # year
+    period = _extract_year(stmt, default_period)
+
+    # optional lead time set
+    lt = None
+    mlt = re.search(r"set\s+lead\s*time\s+to\s+(-?\d+)", stmt, flags=re.I)
+    if mlt:
+        try:
+            lt = int(mlt.group(1))
+        except Exception:
+            lt = None
+
+    upd: Dict[str, Any] = {
+        "product": product,
+        "customer": customer,
+        "location": location,
+        "delta_pct": pct
+    }
+    if lt is not None:
+        upd["set"] = {"Lead Time": lt}
+
+    return {"period": period, "demand_updates": [upd]}
+
+def _parse_warehouse(stmt: str, ent: Dict[str, List[str]], default_period: int) -> Optional[Dict[str, Any]]:
+    """
+    Patterns:
+      Cap <Warehouse> Maximum Capacity at <value>
+      Force close <Warehouse>
+      Force open <Warehouse>
+    """
+    wh = _find_entity(stmt, ent["warehouses"])
+    if not wh:
+        return None
+
+    # Cap capacity
+    if re.search(r"\bcap\b.*\bmaximum\s+capacity\b", stmt, flags=re.I) or re.search(r"\bmaximum\s+capacity\b.*\bto|at\b", stmt, flags=re.I):
+        val = _extract_number(stmt)
+        if val is None:
+            return None
+        return {"warehouse_changes": [{"warehouse": wh, "field": "Maximum Capacity", "new_value": float(val)}]}
+
+    # Force close
+    if re.search(r"\bforce\s+close\b", stmt, flags=re.I):
+        return {"warehouse_changes": [{"warehouse": wh, "field": "Force Close", "new_value": 1},
+                                      {"warehouse": wh, "field": "Force Open", "new_value": 0}]}
+
+    # Force open
+    if re.search(r"\bforce\s+open\b", stmt, flags=re.I):
+        return {"warehouse_changes": [{"warehouse": wh, "field": "Force Open", "new_value": 1},
+                                      {"warehouse": wh, "field": "Force Close", "new_value": 0}]}
+
+    return None
+
+def _parse_supplier(stmt: str, ent: Dict[str, List[str]], default_period: int) -> Optional[Dict[str, Any]]:
+    """
+    Pattern:
+      Enable <Product> at <Supplier> [for 2023]
+    """
+    if not re.search(r"\benable\b", stmt, flags=re.I):
+        return None
+    product = _find_entity(stmt, ent["products"])
+    supplier = _find_entity(stmt, ent["suppliers"])
+    if not product or not supplier:
+        return None
+    period = _extract_year(stmt, default_period)
+    # Default location to supplier token (common in your files: Antalya_FG)
+    location = supplier
     return {
         "period": period,
-        "demand_updates": [],
-        "warehouse_changes": [],
-        "supplier_changes": [],
-        "transport_updates": [],
-        "adds": {
-            "customers": [],
-            "customer_demands": [],
-            "warehouses": [],
-            "supplier_products": [],
-            "transport_lanes": [],
-        },
-        "deletes": {
-            "customers": [],
-            "customer_product_rows": [],
-            "warehouses": [],
-            "supplier_products": [],
-            "transport_lanes": [],
-        }
+        "supplier_changes": [
+            {"product": product, "supplier": supplier, "location": location, "field": "Available", "new_value": 1}
+        ]
     }
 
-def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
-    if not prompt:
-        return _base_scenario(default_period)
-    text = prompt.strip()
+def _parse_transport(stmt: str, ent: Dict[str, List[str]], default_period: int) -> Optional[Dict[str, Any]]:
+    """
+    Pattern:
+      Set <Mode> lane <From> -> <To> for <Product> to Cost Per UOM = <value> [in <year>]
+    Accept variants like '→', 'to', 'cpu', 'cost per uom', 'cost/uom'.
+    """
+    if not re.search(r"\bset\b.*\blane\b", stmt, flags=re.I):
+        return None
 
-    # "run base model"
-    if text.lower() in {"run base model", "run the base model"}:
-        s = _base_scenario(default_period)
-        s["meta"] = {"run_base": True}
-        return s
+    mode = _find_entity(stmt, ent["modes"])
+    product = _find_entity(stmt, ent["products"])
+    # From/To locations or warehouse/customer names (both become locations)
+    # Try to find a 'from' candidate among warehouses/locations first
+    from_loc = None
+    to_loc = None
 
-    cats = _catalog(dfs)
-    s = _base_scenario(default_period)
+    # Detect arrow or 'to' direction
+    arrow = re.search(r"lane\s+(.+?)\s*(?:->|→|to)\s*(.+?)\s+(?:for\b|cost\b|cpu\b|with\b)", stmt, flags=re.I)
+    if arrow:
+        left = arrow.group(1).strip()
+        right = arrow.group(2).strip()
+        # choose best matches
+        from_loc = _find_entity(left, ent["warehouses"]) or _find_entity(left, ent["locations"]) or _find_entity(left, ent["customers"])
+        to_loc   = _find_entity(right, ent["customers"]) or _find_entity(right, ent["locations"]) or _find_entity(right, ent["warehouses"])
 
-    # Period override (first 4-digit year wins)
-    m_year = re.search(r"\b(20\d{2})\b", text)
-    if m_year:
-        s["period"] = int(m_year.group(1))
+    if not (mode and product and from_loc and to_loc):
+        return None
 
-    # ========= Updates (existing behavior) =========
+    # CPU extraction
+    m_cost = re.search(r"(?:cost\s*per\s*uom|cost\/uom|cpu)\s*(?:=|to)?\s*(-?\d+(?:\.\d+)?)", stmt, flags=re.I)
+    if not m_cost:
+        return None
+    try:
+        cpu = float(m_cost.group(1))
+    except Exception:
+        return None
 
-    # Demand increase/decrease by %
-    dm = re.search(r"(increase|decrease)\s+([A-Za-z0-9\-\s]+)\s+demand\s+at\s+([A-Za-z0-9\-\s]+)\s+by\s+(\d+(?:\.\d+)?)\s*%", text, re.I)
-    if dm:
-        kind, prod, cust, pct = dm.groups()
-        prod = prod.strip()
-        cust = cust.strip()
-        if prod in cats["products"] and cust in cats["customers"]:
-            delta = float(pct) * (1 if kind.lower()=="increase" else -1)
-            upd = {"product": prod, "customer": cust, "location": cust, "delta_pct": delta}
-            m_lt = re.search(r"set\s+lead\s*time\s+to\s+(\d+)", text, re.I)
-            if m_lt:
-                upd["set"] = {"Lead Time": float(m_lt.group(1))}
-            s["demand_updates"].append(upd)
+    period = _extract_year(stmt, default_period)
+    return {
+        "transport_updates": [{
+            "mode": mode,
+            "product": product,
+            "from_location": from_loc,
+            "to_location": to_loc,
+            "period": period,
+            "fields": {"Cost Per UOM": cpu, "Available": 1}
+        }]
+    }
 
-    # Warehouse changes
-    m_cap = re.search(r"cap\s+([A-Za-z0-9\-_]+)\s+maximum\s+capacity\s+at\s+(\d+(?:\.\d+)?)", text, re.I)
-    if m_cap:
-        wh, val = m_cap.groups()
-        wh = wh.strip()
-        if wh in cats["warehouses"]:
-            s["warehouse_changes"].append({"warehouse": wh, "field": "Maximum Capacity", "new_value": float(val)})
+# -------------------------- Merge & Public API --------------------------
 
-    for cmd, fld in [("force close", "Force Close"), ("force open", "Force Open")]:
-        m_fc = re.search(rf"{cmd}\s+([A-Za-z0-9\-_]+)", text, re.I)
-        if m_fc:
-            wh = m_fc.group(1).strip()
-            if wh in cats["warehouses"]:
-                s["warehouse_changes"].append({"warehouse": wh, "field": fld, "new_value": 1})
+def _merge_scenarios(base: Dict[str, Any], add: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge two scenario dicts safely."""
+    out = dict(base)
+    # period: keep earliest explicit mention or default
+    if "period" in add:
+        out["period"] = add.get("period", out.get("period", DEFAULT_PERIOD))
 
-    # Supplier enablement (update Available=1)
-    for sup in cats["suppliers"]:
-        m_en = re.search(rf"enable\s+([A-Za-z0-9\-\s]+)\s+at\s+{re.escape(sup)}", text, re.I)
-        if m_en:
-            prod = m_en.group(1).strip()
-            if prod in cats["products"]:
-                s["supplier_changes"].append({"product": prod, "supplier": sup, "location": sup, "field": "Available", "new_value": 1})
+    for key in ("demand_updates", "warehouse_changes", "supplier_changes", "transport_updates"):
+        if add.get(key):
+            out.setdefault(key, [])
+            out[key].extend(add[key])
 
-    # Transport lane cost
-    m_tc = re.search(
-        r"set\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s]+)\s+for\s+([A-Za-z0-9\-\s]+)\s+to\s+cost\s+per\s+uom\s*=?\s*(\d+(?:\.\d+)?)",
-        text, re.I
-    )
-    if m_tc:
-        mode, fr, to, prod, cost = m_tc.groups()
-        mode = mode.strip(); fr = fr.strip(); to = to.strip(); prod = prod.strip()
-        if mode in cats["modes"] and prod in cats["products"] and fr in cats["locations"] and to in cats["customers"]:
-            s["transport_updates"].append({
-                "mode": mode,
-                "product": prod,
-                "from_location": fr,
-                "to_location": to,
-                "period": s["period"],
-                "fields": {"Cost Per UOM": float(cost), "Available": 1}
-            })
+    # propagate notes
+    if add.get("_notes"):
+        out.setdefault("_notes", [])
+        out["_notes"].extend(add["_notes"])
 
-    # ========= Adds (CRUD) =========
+    return out
 
-    # Add customer
-    m_add_cust = re.search(r"add\s+customer\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+([A-Za-z0-9\-\s_]+))?", text, re.I)
-    if m_add_cust:
-        cust = m_add_cust.group(1).strip()
-        loc  = (m_add_cust.group(2) or cust).strip()
-        s["adds"]["customers"].append({"customer": cust, "location": loc})
+def parse_rules(text: str, dfs: Dict[str, pd.DataFrame], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
+    """
+    Parse free text into a scenario JSON using deterministic rules and entities from dfs.
+    Skips statements that don't match or reference unknown entities; records reasons in _notes.
+    """
+    scenario: Dict[str, Any] = {"period": int(default_period)}
+    notes: List[str] = []
 
-    # Add demand row after add customer phrase or standalone
-    m_add_dem = re.search(r"demand\s+(\d+(?:\.\d+)?)\s+of\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-    if m_add_dem:
-        qty, prod = m_add_dem.groups()
-        qty = float(qty); prod = prod.strip()
-        # Try to infer customer from an earlier "add customer" or "...at <customer>"
-        cust = None
-        m_infer1 = re.search(r"add\s+customer\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-        if m_infer1:
-            cust = m_infer1.group(1).strip()
-        if not cust:
-            m_infer2 = re.search(r"at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-            if m_infer2:
-                cust = m_infer2.group(1).strip()
-        if cust:
-            lead = None
-            m_lead = re.search(r"lead\s*time\s*(?:=|to)?\s*(\d+)", text, re.I)
-            if m_lead:
-                lead = float(m_lead.group(1))
-            s["adds"]["customer_demands"].append({
-                "product": prod, "customer": cust, "location": cust, "period": s["period"], "demand": qty, **({"lead_time": lead} if lead is not None else {})
-            })
+    if not text or not isinstance(text, str):
+        scenario["_notes"] = ["Empty prompt; no edits."]
+        return scenario
 
-    # Add warehouse
-    m_add_wh = re.search(r"add\s+warehouse\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+([A-Za-z0-9\-\s_]+))?", text, re.I)
-    if m_add_wh:
-        wh = m_add_wh.group(1).strip()
-        loc = (m_add_wh.group(2) or wh).strip()
-        fields = {}
-        m_cap2 = re.search(r"maximum\s+capacity\s*(?:=|at)?\s*(\d+(?:\.\d+)?)", text, re.I)
-        if m_cap2:
-            fields["Maximum Capacity"] = float(m_cap2.group(1))
-        if re.search(r"force\s+open", text, re.I):
-            fields["Force Open"] = 1
-            fields["Force Close"] = 0
-        s["adds"]["warehouses"].append({"warehouse": wh, "location": loc, "fields": fields})
+    ent = _collect_entities(dfs)
+    statements = _split_statements(text)
 
-    # Add supplier product availability
-    m_add_sp = re.search(r"enable\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-    if m_add_sp:
-        prod = m_add_sp.group(1).strip()
-        sup  = m_add_sp.group(2).strip()
-        s["adds"]["supplier_products"].append({"product": prod, "supplier": sup, "location": sup, "period": s["period"], "fields": {"Available": 1}})
+    for raw in statements:
+        stmt = raw.strip()
+        if not stmt:
+            continue
+        matched = False
 
-    # Add transport lane
-    m_add_lane = re.search(
-        r"(?:add|create)\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-\s_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s_]+)\s+for\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+cost\s+per\s+uom\s*=?\s*(\d+(?:\.\d+)?))?",
-        text, re.I
-    )
-    if m_add_lane:
-        mode, fr, to, prod, cost = m_add_lane.groups()
-        fields = {"Available": 1}
-        if cost:
-            fields["Cost Per UOM"] = float(cost)
-        s["adds"]["transport_lanes"].append({
-            "mode": mode.strip(), "product": prod.strip(), "from_location": fr.strip(), "to_location": to.strip(),
-            "period": s["period"], "fields": fields
-        })
+        # Try each parser in priority order
+        for fn in (_parse_demand, _parse_warehouse, _parse_supplier, _parse_transport):
+            try:
+                out = fn(stmt, ent, default_period)
+            except Exception:
+                out = None
+            if out:
+                scenario = _merge_scenarios(scenario, out)
+                matched = True
+                break
 
-    # ========= Deletes (CRUD) =========
+        if not matched:
+            notes.append(f"Skipped: '{stmt}' (no matching rule or unknown entities).")
 
-    # Delete customer
-    m_del_cust = re.search(r"delete\s+customer\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-    if m_del_cust:
-        s["deletes"]["customers"].append({"customer": m_del_cust.group(1).strip()})
+    if notes:
+        scenario["_notes"] = notes
 
-    # Delete warehouse
-    m_del_wh = re.search(r"delete\s+warehouse\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-    if m_del_wh:
-        s["deletes"]["warehouses"].append({"warehouse": m_del_wh.group(1).strip()})
+    # If nothing parsed, keep empty lists for consistency
+    for key in ("demand_updates", "warehouse_changes", "supplier_changes", "transport_updates"):
+        scenario.setdefault(key, [])
 
-    # Delete supplier product
-    m_del_sp = re.search(r"delete\s+supplier\s+product\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
-    if m_del_sp:
-        prod = m_del_sp.group(1).strip(); sup = m_del_sp.group(2).strip()
-        s["deletes"]["supplier_products"].append({"product": prod, "supplier": sup})
-
-    # Delete transport lane
-    m_del_lane = re.search(
-        r"delete\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-\s_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s_]+)\s+for\s+([A-Za-z0-9\-\s_]+)(?:\s+in\s+(20\d{2}))?",
-        text, re.I
-    )
-    if m_del_lane:
-        mode, fr, to, prod, yr = m_del_lane.groups()
-        period = int(yr) if yr else s["period"]
-        s["deletes"]["transport_lanes"].append({
-            "mode": mode.strip(), "product": prod.strip(), "from_location": fr.strip(), "to_location": to.strip(), "period": period
-        })
-
-    # Delete specific CPD row
-    m_del_cpd = re.search(r"delete\s+demand\s+for\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)(?:\s+in\s+(20\d{2}))?", text, re.I)
-    if m_del_cpd:
-        prod, cust, yr = m_del_cpd.groups()
-        period = int(yr) if yr else s["period"]
-        s["deletes"]["customer_product_rows"].append({"product": prod.strip(), "customer": cust.strip(), "location": cust.strip(), "period": period})
-
-    return s
+    return scenario
