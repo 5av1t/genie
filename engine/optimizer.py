@@ -4,6 +4,7 @@ import pandas as pd
 import pulp
 
 DEFAULT_PERIOD = 2023
+UNMET_PENALTY = 1_000_000.0  # large penalty to strongly prefer serving demand
 
 # ----------------- numeric coercion helpers -----------------
 
@@ -73,7 +74,7 @@ def _candidate_customers(to_loc: str, customers_df: pd.DataFrame) -> List[str]:
     to_loc = str(to_loc)
     out = set()
     if not isinstance(customers_df, pd.DataFrame) or customers_df.empty:
-        # If no Customers sheet, we can only match by exact customer name (unknown).
+        # If no Customers sheet, best effort: assume To is the customer name.
         out.add(to_loc)
         return list(out)
     # exact customer match
@@ -99,9 +100,13 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
       - Period blank in TC matches current period
       - Cost Per UOM may be computed as Retrieve Distance × Cost per Distance if missing
 
+    Demand is enforced with unmet variables:
+      sum_in(w->c,p) + u[c,p] = demand[c,p],  u[c,p] >= 0
+      Objective includes UNMET_PENALTY * u[c,p], making service preferred whenever feasible.
+
     Returns:
       kpis: dict with status/served/total_cost/service_pct/open_warehouses/total_demand
-      diag: dict with flows, binding caps, lane summaries, throughput, cap_by_warehouse, num_arcs
+      diag: dict with flows, binding caps, lane summaries, throughput, cap_by_warehouse, num_arcs, penalty_cost
     """
     cpd = dfs.get("Customer Product Data")
     wh  = dfs.get("Warehouse")
@@ -109,9 +114,9 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     customers = dfs.get("Customers")
 
     kpis = {"status": "ok", "total_cost": None, "total_demand": 0, "served": 0, "service_pct": 0.0, "open_warehouses": 0}
-    diag: Dict[str, Any] = {"flows": [], "binding_warehouses": [], "num_arcs": 0}
+    diag: Dict[str, Any] = {"flows": [], "binding_warehouses": [], "num_arcs": 0, "penalty_cost": 0.0}
 
-    # Presence
+    # Presence checks
     if not isinstance(wh, pd.DataFrame) or wh.empty:
         kpis["status"] = "no_warehouses"; return kpis, diag
     if not isinstance(cpd, pd.DataFrame) or cpd.empty:
@@ -140,14 +145,14 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     if total_demand <= 0:
         kpis["status"] = "no_positive_demand"; return kpis, diag
 
-    # Warehouse capacities (sum across rows if multiple)
+    # Warehouse capacities
     cap: Dict[str, float] = {}
     for _, r in wh.iterrows():
         w = str(r.get("Warehouse"))
         cap[w] = cap.get(w, 0.0) + _warehouse_capacity(r)
 
-    # Build arcs more flexibly
-    arcs: Dict[Tuple[str, str, str], float] = {}  # (warehouse, customer, product) -> unit cost
+    # Build arcs (warehouse, customer, product) with flexible matching
+    arcs: Dict[Tuple[str, str, str], float] = {}
     tcp = tc.copy()
 
     def _row_matches_period(row) -> bool:
@@ -190,9 +195,8 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
             continue
 
         # product logic: blank product in TC applies to all products with demand
-        prod_list: Iterable[str]
         if tc_prod.strip() == "" or tc_prod.lower() == "nan":
-            prod_list = products_with_demand
+            prod_list: Iterable[str] = products_with_demand
         else:
             prod_list = [tc_prod]
 
@@ -210,15 +214,18 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     # Variables
     m = pulp.LpProblem("SimpleNetworkFlow", pulp.LpMinimize)
     x: Dict[Tuple[str, str, str], pulp.LpVariable] = {k: pulp.LpVariable(f"flow::{k[0]}->{k[1]}::{k[2]}", lowBound=0) for k in arcs.keys()}
+    u: Dict[Tuple[str, str], pulp.LpVariable] = {k: pulp.LpVariable(f"unmet::{k[0]}::{k[1]}", lowBound=0) for k in dem.keys()}  # unmet by (customer,product)
 
-    # Objective
-    m += pulp.lpSum(arcs[k] * var for k, var in x.items())
+    # Objective = transport cost + unmet penalty
+    transport_cost = pulp.lpSum(arcs[k] * var for k, var in x.items())
+    penalty_cost   = pulp.lpSum(UNMET_PENALTY * var for var in u.values())
+    m += transport_cost + penalty_cost
 
-    # Demand satisfaction: sum_in <= demand
+    # Demand satisfaction with unmet: sum_in + u = demand
     for (c, p), d in dem.items():
-        m += pulp.lpSum(x[(w, c, p)] for (w, cc, pp) in x.keys() if cc == c and pp == p) <= _to_float(d, 0.0), f"demand_{c}_{p}"
+        m += pulp.lpSum(x[(w, c, p)] for (w, cc, pp) in x.keys() if cc == c and pp == p) + u[(c, p)] == _to_float(d, 0.0), f"demand_{c}_{p}"
 
-    # Warehouse capacity: sum_out <= finite capacity
+    # Warehouse capacity: sum_out <= capacity
     for w in set(k[0] for k in x.keys()):
         cmax = _to_float(cap.get(w, 0.0), 0.0)
         cmax = 0.0 if (not math.isfinite(cmax) or cmax < 0) else cmax
@@ -230,25 +237,28 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     # Results
     flows: List[Dict[str, Any]] = []
     served = 0.0
-    total_cost = 0.0
+    trans_cost_val = 0.0
     for (w, c, p), var in x.items():
         val = _to_float(var.value(), 0.0)
         if val > 1e-9:
             unit = _to_float(arcs[(w, c, p)], 0.0)
             flows.append({"warehouse": w, "customer": c, "product": p, "qty": val, "unit_cost": unit})
             served += val
-            total_cost += val * unit
+            trans_cost_val += val * unit
+
+    unmet_total = sum(_to_float(var.value(), 0.0) for var in u.values())
+    penalty_val = unmet_total * UNMET_PENALTY
 
     # KPIs
+    total_demand = kpis["total_demand"]
     kpis["served"] = served
-    kpis["total_cost"] = round(total_cost, 4) if served > 0 else None
     kpis["service_pct"] = round((served / total_demand) * 100.0, 2) if total_demand > 0 else 0.0
     kpis["open_warehouses"] = int(sum(1 for w, v in cap.items() if _to_float(v, 0.0) > 0))
+    kpis["total_cost"] = round(trans_cost_val, 4) if served > 0 else 0.0  # transport only
     try:
         kpis["status"] = pulp.LpStatus[m.status].lower()
     except Exception:
-        if served <= 0:
-            kpis["status"] = "no_feasible_arcs"
+        pass
 
     # Diagnostics
     used_by_w: Dict[str, float] = {}
@@ -282,6 +292,8 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
         "lowest_throughput_warehouses": wh_throughput_sorted[:5],
         "cap_by_warehouse": {w: _to_float(v, 0.0) for w, v in cap.items()},
         "num_arcs": len(arcs),
+        "unmet_total": unmet_total,
+        "penalty_cost": penalty_val,
     })
 
     return kpis, diag
