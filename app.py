@@ -1,4 +1,4 @@
-# --- GENIE: Streamlit App (Gemini + OpenAI + Rules, CRUD flows, Dynamic Examples, Auto-Connect, Maps, Optimizer) ---
+# --- GENIE: Streamlit App (Gemini/OpenAI + Rules, CRUD flows, Auto-Connect, Maps, Optimizer) ---
 
 import os
 from io import BytesIO
@@ -10,7 +10,7 @@ import pandas as pd
 try:
     import streamlit as st
 except ModuleNotFoundError:
-    print("This app requires Streamlit. Add `streamlit` to requirements.txt and redeploy.")
+    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt.")
     raise
 
 # Optional mapping lib
@@ -21,27 +21,29 @@ except Exception:
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# ========= Secrets → env (OpenAI + Gemini) =========
+# ========= Read secrets → env for providers (optional convenience) =========
 if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
+if "gcp" in st.secrets and "gemini_api_key" in st.secrets["gcp"]:
+    os.environ["GEMINI_API_KEY"] = st.secrets["gcp"]["gemini_api_key"]
 if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
     os.environ["GEMINI_API_KEY"] = st.secrets["gemini"]["api_key"]
 
 # ========= Imports from engine =========
 missing_engine = []
 
-# Loader
+# Loader (required)
 try:
     from engine.loader import load_and_validate_excel as loader
 except Exception as e:
     st.error(
-        "❌ Could not import a loader from engine/loader.py.\n"
-        "Ensure `load_and_validate_excel(file)` exists.\n\n"
+        "❌ Could not import loader from engine/loader.py.\n"
+        "Make sure `load_and_validate_excel(file_like)` exists.\n\n"
         f"Import error: {e}"
     )
     st.stop()
 
-# Parsers and engine
+# Parsers & engine
 try:
     from engine.parser import parse_prompt as parse_rules
 except ModuleNotFoundError:
@@ -52,23 +54,26 @@ try:
     from engine.updater import apply_scenario
 except ModuleNotFoundError:
     missing_engine.append("engine/updater.py (apply_scenario)")
+    apply_scenario = None
 
 try:
     from engine.optimizer import run_optimizer
 except ModuleNotFoundError:
     missing_engine.append("engine/optimizer.py (run_optimizer)")
+    run_optimizer = None
 
 try:
     from engine.reporter import build_summary
 except ModuleNotFoundError:
     missing_engine.append("engine/reporter.py (build_summary)")
+    build_summary = None
 
 try:
     from engine.geo import build_nodes, flows_to_geo, guess_map_center
 except ModuleNotFoundError:
-    missing_engine.append("engine/geo.py (build_nodes, flows_to_geo)")
+    missing_engine.append("engine/geo.py (build_nodes, flows_to_geo, guess_map_center)")
+    build_nodes = flows_to_geo = guess_map_center = None
 
-# GenAI (OpenAI/Gemini) + Example generator
 try:
     from engine.genai import parse_with_llm, summarize_scenario
 except ModuleNotFoundError:
@@ -86,7 +91,7 @@ if missing_engine:
 
 # ========= Header =========
 st.title("🔮 GENIE — Generative Engine for Network Intelligence & Execution")
-st.caption("Upload a base-case workbook → describe changes → GENIE updates sheets, optimizes, and maps your network.")
+st.caption("Upload a base case → describe a scenario → GENIE updates sheets, optimizes, and maps your network.")
 
 # ========= Sidebar: Provider & Options =========
 with st.sidebar:
@@ -95,14 +100,18 @@ with st.sidebar:
         "Model Provider",
         ["Google Gemini (free tier)", "OpenAI", "Rules only (no LLM)"],
         index=0,
-        help="Use Gemini for free starter usage. Switch to OpenAI if you have billing. Rules-only disables GenAI parsing & example generation.",
+        help="Gemini free tier is recommended for demos. Switch to OpenAI if you have billing. Rules-only disables LLM parsing."
     )
     use_llm_parser = st.checkbox(
-        "Use GenAI parser for scenarios",
+        "Use GenAI parser",
         value=(provider != "Rules only (no LLM)"),
-        help="If off, the rules parser is used for NL → Scenario JSON."
+        help="If off, use the rules parser only."
     )
-    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False)
+    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug tabs)", value=False)
+    st.markdown("---")
+    st.caption("Tip: Set Gemini key in **.streamlit/secrets.toml** as:\n\n"
+               "```toml\n[gcp]\n gemini_api_key = \"YOUR_KEY\"\n```\n"
+               "Or set `GEMINI_API_KEY` env var. The app auto-detects.")
 
 # ========= Static examples (pre-upload fallback) =========
 STATIC_EXAMPLES = [
@@ -111,13 +120,13 @@ STATIC_EXAMPLES = [
     "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
     "Enable Thin-Film at Antalya_FG",
     "Set Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline to cost per uom = 9.5",
-    # CRUD examples
+    # CRUD samples
     "Add customer Muscat; demand 8000 of Mono-Crystalline; lead time 9",
     "Add warehouse Prague_CDC at Prague; Maximum Capacity 30000; force open",
     "Delete Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline in 2023",
 ]
 
-with st.expander("💡 Prompt examples (static fallback)"):
+with st.expander("💡 Prompt examples (static)"):
     for ex in STATIC_EXAMPLES:
         st.code(ex, language="text")
     chosen = st.selectbox("Insert example:", ["(choose one)"] + STATIC_EXAMPLES, key="static_select")
@@ -129,7 +138,7 @@ with st.expander("💡 Prompt examples (static fallback)"):
 # ========= Inputs =========
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
 user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt")
-process = st.button("🚀 Process Scenario")
+process_btn = st.button("🚀 Process Scenario")
 
 # ========= Helpers: Delta Views & Auto-connect =========
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, key_cols: list) -> pd.DataFrame:
@@ -181,14 +190,14 @@ def show_delta_block(title: str, before: pd.DataFrame, after: pd.DataFrame, key_
         st.info(f"No visible changes detected in {title}.")
 
 def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
+    """Create placeholder lanes Warehouse.Location → Customer for demanded pairs."""
     wh = dfs.get("Warehouse", pd.DataFrame())
     cpd = dfs.get("Customer Product Data", pd.DataFrame())
     tc  = dfs.get("Transport Cost", pd.DataFrame())
     if not isinstance(tc, pd.DataFrame) or tc.empty:
         tc = pd.DataFrame(columns=[
             "Mode of Transport","Product","From Location","To Location","Period",
-            "UOM","Available","Retrieve Distance","Average Load Size",
-            "Cost Per UOM","Cost per Distance","Cost per Trip","Minimum Cost Per Trip",
+            "UOM","Available","Retrieve Distance","Average Load Size","Cost Per UOM","Cost per Distance","Cost per Trip","Minimum Cost Per Trip",
         ])
     # warehouse -> location
     wlocs = {}
@@ -205,7 +214,10 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
             use = use[use["Period"] == period]
         for _, r in use.iterrows():
             cust = str(r.get("Customer")); prod = str(r.get("Product"))
-            dem = float(r.get("Demand", 0) or 0)
+            try:
+                dem = float(r.get("Demand", 0) or 0)
+            except Exception:
+                dem = 0.0
             if dem > 0:
                 need.add((cust, prod))
     # existing arcs
@@ -213,7 +225,8 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         for _, r in tc.iterrows():
             try:
-                if int(r.get("Period", period)) != period: continue
+                if int(r.get("Period", period)) != period: 
+                    continue
             except Exception:
                 continue
             existing.add((str(r.get("From Location")), str(r.get("To Location")), str(r.get("Product"))))
@@ -222,7 +235,8 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     for _, from_loc in wlocs.items():
         for (to_cust, prod) in need:
             key = (str(from_loc), str(to_cust), str(prod))
-            if key in existing: continue
+            if key in existing: 
+                continue
             new_rows.append({
                 "Mode of Transport": "Secondary Delivery LTL",
                 "Product": prod,
@@ -253,23 +267,28 @@ if uploaded_file:
         st.stop()
 
     with st.expander("✅ Sheet Validation Report"):
-        for sheet, rep in validation_report.items():
-            if not isinstance(rep, dict):
-                continue
-            missing = rep.get("missing_columns", [])
-            if missing:
-                st.error(f"{sheet}: Missing columns - {missing}")
-            else:
-                st.success(f"{sheet}: OK ({rep.get('num_rows', 0)} rows, {rep.get('num_columns', 0)} columns)")
-        warns = validation_report.get("_warnings", [])
-        if isinstance(warns, list) and warns:
-            st.warning("General warnings:")
-            for w in warns:
-                st.write(f"• {w}")
+        try:
+            for sheet, rep in validation_report.items():
+                if sheet == "_warnings":
+                    continue
+                if not isinstance(rep, dict):
+                    continue
+                missing = rep.get("missing_columns", [])
+                if missing:
+                    st.error(f"{sheet}: Missing columns - {missing}")
+                else:
+                    st.success(f"{sheet}: OK ({rep.get('num_rows', 0)} rows, {rep.get('num_columns', 0)} columns)")
+            warns = validation_report.get("_warnings", [])
+            if isinstance(warns, list) and warns:
+                st.warning("General warnings:")
+                for w in warns:
+                    st.write(f"• {w}")
+        except Exception as e:
+            st.warning(f"Validation report display issue: {e}")
 
     st.success("Base case loaded successfully.")
 
-    # ---- Dynamic GenAI examples (Gemini/OpenAI) ----
+    # ---- Dynamic GenAI examples from file ----
     st.subheader("💡 Prompt examples (from your file)")
     try:
         fp_hasher = hashlib.sha1()
@@ -281,19 +300,16 @@ if uploaded_file:
     if "examples_cache" not in st.session_state:
         st.session_state["examples_cache"] = {}
 
-    dyn_examples = None
-    if fingerprint in st.session_state["examples_cache"]:
-        dyn_examples = st.session_state["examples_cache"][fingerprint]
-    else:
+    dyn_examples = st.session_state["examples_cache"].get(fingerprint, None)
+    if dyn_examples is None:
+        dyn_examples = []
         try:
             if examples_for_file is not None:
                 prov = "gemini" if provider.startswith("Google") else ("openai" if provider == "OpenAI" else "none")
-                dyn_examples = examples_for_file(dataframes, provider=prov)
-            else:
-                dyn_examples = []
+                dyn_examples = examples_for_file(dataframes, provider=prov) or []
         except Exception:
             dyn_examples = []
-        st.session_state["examples_cache"][fingerprint] = dyn_examples or []
+        st.session_state["examples_cache"][fingerprint] = dyn_examples
 
     if dyn_examples:
         for ex in dyn_examples:
@@ -306,13 +322,13 @@ if uploaded_file:
     else:
         st.info("Could not generate dynamic examples (using static examples above).")
 
-    # ---- Early map (nodes only) ----
+    # ---- Map (nodes only, right after upload) ----
     st.subheader("🌍 Network Map (Nodes)")
-    if pdk:
+    if pdk and build_nodes and guess_map_center:
         try:
             nodes_df = build_nodes(dataframes)
             if nodes_df.empty:
-                st.info("No geocoded nodes yet. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
+                st.info("No geocoded nodes yet. Ensure a 'Locations' sheet with Latitude/Longitude or recognized city names.")
             else:
                 lat0, lon0 = guess_map_center(nodes_df)
                 wh_nodes = nodes_df[nodes_df["type"] == "warehouse"]
@@ -347,9 +363,9 @@ if uploaded_file:
         except Exception as e:
             st.warning(f"Map rendering skipped: {e}")
     else:
-        st.info("pydeck not available in this environment, skipping map.")
+        st.info("pydeck not available or geo module missing; skipping map.")
 
-    # ---- LLM vs Rules (optional debug) ----
+    # ---- Optional: LLM vs Rules debug tabs ----
     if show_llm_vs_rules and (st.session_state.get("user_prompt") or "").strip():
         tabs = st.tabs(["LLM Parser", "Rules Parser", "Diff"])
         llm_scenario = None
@@ -359,7 +375,11 @@ if uploaded_file:
                 st.error("GenAI parser disabled or not available.")
             else:
                 prov = "gemini" if provider.startswith("Google") else "openai"
-                llm_scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
+                try:
+                    llm_scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
+                except Exception as e:
+                    llm_scenario = {}
+                    st.error(f"LLM parse error: {e}")
                 if summarize_scenario:
                     bullets = summarize_scenario(llm_scenario)
                     st.markdown("**Summary**")
@@ -370,7 +390,11 @@ if uploaded_file:
             if parse_rules is None:
                 st.error("Rules parser not available.")
             else:
-                rules_scenario = parse_rules(st.session_state["user_prompt"], dataframes, default_period=2023)
+                try:
+                    rules_scenario = parse_rules(st.session_state["user_prompt"], dataframes, default_period=2023)
+                except Exception as e:
+                    rules_scenario = {}
+                    st.error(f"Rules parse error: {e}")
                 if summarize_scenario:
                     bullets = summarize_scenario(rules_scenario)
                     st.markdown("**Summary**")
@@ -378,7 +402,7 @@ if uploaded_file:
                 with st.expander("Advanced: raw JSON"):
                     st.json(rules_scenario)
         with tabs[2]:
-            st.markdown("**Simple textual diff**:")
+            st.markdown("**Simple textual diff**")
             try:
                 import difflib
                 a = json.dumps(llm_scenario or {}, indent=2, sort_keys=True).splitlines()
@@ -389,7 +413,7 @@ if uploaded_file:
                 st.info(f"Diff unavailable: {e}")
 
     # ---- Main Process flow ----
-    if process and (st.session_state.get("user_prompt") or "").strip():
+    if process_btn and (st.session_state.get("user_prompt") or "").strip():
         # 1) Parse NL → Scenario JSON (LLM or rules)
         try:
             if use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
@@ -414,7 +438,9 @@ if uploaded_file:
         run_base = str(st.session_state["user_prompt"]).strip().lower() in {"run the base model", "run base model"}
 
         # Deletion safety
-        pending_deletes = sum(len(v) for v in (scenario.get("deletes") or {}).values()) if isinstance(scenario.get("deletes"), dict) else 0
+        pending_deletes = 0
+        if isinstance(scenario.get("deletes"), dict):
+            pending_deletes = sum(len(v) for v in scenario["deletes"].values() if isinstance(v, list))
         allow_delete = True
         if pending_deletes > 0:
             allow_delete = st.checkbox(
@@ -481,6 +507,9 @@ if uploaded_file:
                 st.info(f"Auto-connect created {created} placeholder lane(s) at Cost Per UOM = 10.0")
 
         # 3) Optimization → KPIs + flows
+        if run_optimizer is None:
+            st.error("Optimizer module missing.")
+            st.stop()
         kpis, diag = run_optimizer(updated, period=scenario.get("period", 2023))
 
         col1, col2 = st.columns([1,1])
@@ -489,7 +518,10 @@ if uploaded_file:
             st.write(kpis)
         with col2:
             st.subheader("📝 Executive Summary")
-            st.markdown(build_summary(st.session_state["user_prompt"], scenario, kpis, diag))
+            if build_summary:
+                st.markdown(build_summary(st.session_state["user_prompt"], scenario, kpis, diag))
+            else:
+                st.info("reporter.build_summary missing.")
 
         status = (kpis or {}).get("status")
         if status in {"no_feasible_arcs", "no_demand", "no_positive_demand"}:
@@ -502,7 +534,7 @@ if uploaded_file:
 
         # 4) Network Map (with flows if any)
         st.subheader("🌍 Network Map (With Flows)")
-        if pdk:
+        if pdk and build_nodes and flows_to_geo and guess_map_center:
             try:
                 nodes_df = build_nodes(updated)
                 flows = (diag or {}).get("flows", [])
@@ -522,7 +554,7 @@ if uploaded_file:
                             get_radius=60000,
                             pickable=True,
                             filled=True,
-                            get_fill_color=[30, 136, 229],
+                            get_fill_color=[30, 136, 229],  # blue
                         ))
                     if not cu_nodes.empty:
                         layers.append(pdk.Layer(
@@ -532,7 +564,7 @@ if uploaded_file:
                             get_radius=40000,
                             pickable=True,
                             filled=True,
-                            get_fill_color=[76, 175, 80],
+                            get_fill_color=[76, 175, 80],  # green
                         ))
                     if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
                         arcs_df = arcs_df.assign(width=(arcs_df["qty"].clip(lower=1) ** 0.5))
@@ -555,35 +587,19 @@ if uploaded_file:
             except Exception as e:
                 st.warning(f"Map rendering skipped: {e}")
         else:
-            st.info("pydeck not available in this environment, skipping map.")
+            st.info("pydeck not available or geo module missing; skipping map.")
 
         # 5) Delta Views
         st.subheader("Δ Delta Views (Changes Only)")
-        show_delta_block(
-            "Customers",
-            before_cu, after_cu,
-            ["Customer", "Location"],
-        )
-        show_delta_block(
-            "Customer Product Data",
-            before_cpd, after_cpd,
-            ["Product", "Customer", "Location", "Period"],
-        )
+        show_delta_block("Customers", before_cu, after_cu, ["Customer", "Location"])
+        show_delta_block("Customer Product Data", before_cpd, after_cpd, ["Product", "Customer", "Location", "Period"])
         if isinstance(after_wh, pd.DataFrame) and not after_wh.empty:
             wh_keys = ["Warehouse"] + (["Period"] if "Period" in after_wh.columns and "Period" in before_wh.columns else [])
             show_delta_block("Warehouse", before_wh, after_wh, wh_keys)
         if isinstance(after_sp, pd.DataFrame) and not after_sp.empty:
-            show_delta_block(
-                "Supplier Product",
-                before_sp, after_sp,
-                ["Product", "Supplier", "Location", "Period"],
-            )
+            show_delta_block("Supplier Product", before_sp, after_sp, ["Product", "Supplier", "Location", "Period"])
         if isinstance(after_tc, pd.DataFrame) and not after_tc.empty:
-            show_delta_block(
-                "Transport Cost",
-                before_tc, after_tc,
-                ["Mode of Transport", "Product", "From Location", "To Location", "Period"],
-            )
+            show_delta_block("Transport Cost", before_tc, after_tc, ["Mode of Transport", "Product", "From Location", "To Location", "Period"])
 
         # 6) Export updated workbook
         st.subheader("💾 Export")
@@ -602,8 +618,10 @@ if uploaded_file:
             )
         except Exception as e:
             st.warning(f"Creating the Excel download failed: {e}")
+
 else:
-    # Sample download (prefer bundling the file; fallback to raw GitHub URL)
+    # No file yet → provide sample download
+    st.info("Upload your base case to begin. Or download a sample template:")
     raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
     if os.path.exists("sample_base_case.xlsx"):
         with open("sample_base_case.xlsx", "rb") as f:
@@ -615,4 +633,4 @@ else:
             )
     else:
         st.markdown(f"[⬇️ Download Sample Base Case Template]({raw_url})")
-        st.info("Tip: add `sample_base_case.xlsx` to the repo root to enable the in‑app download button.")
+        st.caption("Tip: Add `sample_base_case.xlsx` to the repo root to show a direct in‑app download button.")
