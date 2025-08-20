@@ -109,9 +109,7 @@ with st.sidebar:
         help="If off, use the rules parser only."
     )
     show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug tabs)", value=False)
-    st.markdown("---")
-    st.caption("Secrets are configured in Streamlit Cloud → App settings → Secrets.\n"
-               "For local dev, create `.streamlit/secrets.toml`. No secrets are shown in this UI.")
+    
 
 # ========= Inputs (upload first) =========
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
