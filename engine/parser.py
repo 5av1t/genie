@@ -25,7 +25,27 @@ def _catalog(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
     }
 
 def _base_scenario(period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
-    return {"period": period, "demand_updates": [], "warehouse_changes": [], "supplier_changes": [], "transport_updates": []}
+    return {
+        "period": period,
+        "demand_updates": [],
+        "warehouse_changes": [],
+        "supplier_changes": [],
+        "transport_updates": [],
+        "adds": {
+            "customers": [],
+            "customer_demands": [],
+            "warehouses": [],
+            "supplier_products": [],
+            "transport_lanes": [],
+        },
+        "deletes": {
+            "customers": [],
+            "customer_product_rows": [],
+            "warehouses": [],
+            "supplier_products": [],
+            "transport_lanes": [],
+        }
+    }
 
 def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
     if not prompt:
@@ -41,10 +61,12 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
     cats = _catalog(dfs)
     s = _base_scenario(default_period)
 
-    # Period override if any 4-digit year appears
+    # Period override (first 4-digit year wins)
     m_year = re.search(r"\b(20\d{2})\b", text)
     if m_year:
         s["period"] = int(m_year.group(1))
+
+    # ========= Updates (existing behavior) =========
 
     # Demand increase/decrease by %
     dm = re.search(r"(increase|decrease)\s+([A-Za-z0-9\-\s]+)\s+demand\s+at\s+([A-Za-z0-9\-\s]+)\s+by\s+(\d+(?:\.\d+)?)\s*%", text, re.I)
@@ -75,7 +97,7 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
             if wh in cats["warehouses"]:
                 s["warehouse_changes"].append({"warehouse": wh, "field": fld, "new_value": 1})
 
-    # Supplier enablement
+    # Supplier enablement (update Available=1)
     for sup in cats["suppliers"]:
         m_en = re.search(rf"enable\s+([A-Za-z0-9\-\s]+)\s+at\s+{re.escape(sup)}", text, re.I)
         if m_en:
@@ -100,5 +122,110 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
                 "period": s["period"],
                 "fields": {"Cost Per UOM": float(cost), "Available": 1}
             })
+
+    # ========= Adds (CRUD) =========
+
+    # Add customer
+    m_add_cust = re.search(r"add\s+customer\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+([A-Za-z0-9\-\s_]+))?", text, re.I)
+    if m_add_cust:
+        cust = m_add_cust.group(1).strip()
+        loc  = (m_add_cust.group(2) or cust).strip()
+        s["adds"]["customers"].append({"customer": cust, "location": loc})
+
+    # Add demand row after add customer phrase or standalone
+    m_add_dem = re.search(r"demand\s+(\d+(?:\.\d+)?)\s+of\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+    if m_add_dem:
+        qty, prod = m_add_dem.groups()
+        qty = float(qty); prod = prod.strip()
+        # Try to infer customer from an earlier "add customer" or "...at <customer>"
+        cust = None
+        m_infer1 = re.search(r"add\s+customer\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+        if m_infer1:
+            cust = m_infer1.group(1).strip()
+        if not cust:
+            m_infer2 = re.search(r"at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+            if m_infer2:
+                cust = m_infer2.group(1).strip()
+        if cust:
+            lead = None
+            m_lead = re.search(r"lead\s*time\s*(?:=|to)?\s*(\d+)", text, re.I)
+            if m_lead:
+                lead = float(m_lead.group(1))
+            s["adds"]["customer_demands"].append({
+                "product": prod, "customer": cust, "location": cust, "period": s["period"], "demand": qty, **({"lead_time": lead} if lead is not None else {})
+            })
+
+    # Add warehouse
+    m_add_wh = re.search(r"add\s+warehouse\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+([A-Za-z0-9\-\s_]+))?", text, re.I)
+    if m_add_wh:
+        wh = m_add_wh.group(1).strip()
+        loc = (m_add_wh.group(2) or wh).strip()
+        fields = {}
+        m_cap2 = re.search(r"maximum\s+capacity\s*(?:=|at)?\s*(\d+(?:\.\d+)?)", text, re.I)
+        if m_cap2:
+            fields["Maximum Capacity"] = float(m_cap2.group(1))
+        if re.search(r"force\s+open", text, re.I):
+            fields["Force Open"] = 1
+            fields["Force Close"] = 0
+        s["adds"]["warehouses"].append({"warehouse": wh, "location": loc, "fields": fields})
+
+    # Add supplier product availability
+    m_add_sp = re.search(r"enable\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+    if m_add_sp:
+        prod = m_add_sp.group(1).strip()
+        sup  = m_add_sp.group(2).strip()
+        s["adds"]["supplier_products"].append({"product": prod, "supplier": sup, "location": sup, "period": s["period"], "fields": {"Available": 1}})
+
+    # Add transport lane
+    m_add_lane = re.search(
+        r"(?:add|create)\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-\s_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s_]+)\s+for\s+([A-Za-z0-9\-\s_]+)(?:\s+at\s+cost\s+per\s+uom\s*=?\s*(\d+(?:\.\d+)?))?",
+        text, re.I
+    )
+    if m_add_lane:
+        mode, fr, to, prod, cost = m_add_lane.groups()
+        fields = {"Available": 1}
+        if cost:
+            fields["Cost Per UOM"] = float(cost)
+        s["adds"]["transport_lanes"].append({
+            "mode": mode.strip(), "product": prod.strip(), "from_location": fr.strip(), "to_location": to.strip(),
+            "period": s["period"], "fields": fields
+        })
+
+    # ========= Deletes (CRUD) =========
+
+    # Delete customer
+    m_del_cust = re.search(r"delete\s+customer\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+    if m_del_cust:
+        s["deletes"]["customers"].append({"customer": m_del_cust.group(1).strip()})
+
+    # Delete warehouse
+    m_del_wh = re.search(r"delete\s+warehouse\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+    if m_del_wh:
+        s["deletes"]["warehouses"].append({"warehouse": m_del_wh.group(1).strip()})
+
+    # Delete supplier product
+    m_del_sp = re.search(r"delete\s+supplier\s+product\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)", text, re.I)
+    if m_del_sp:
+        prod = m_del_sp.group(1).strip(); sup = m_del_sp.group(2).strip()
+        s["deletes"]["supplier_products"].append({"product": prod, "supplier": sup})
+
+    # Delete transport lane
+    m_del_lane = re.search(
+        r"delete\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-\s_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s_]+)\s+for\s+([A-Za-z0-9\-\s_]+)(?:\s+in\s+(20\d{2}))?",
+        text, re.I
+    )
+    if m_del_lane:
+        mode, fr, to, prod, yr = m_del_lane.groups()
+        period = int(yr) if yr else s["period"]
+        s["deletes"]["transport_lanes"].append({
+            "mode": mode.strip(), "product": prod.strip(), "from_location": fr.strip(), "to_location": to.strip(), "period": period
+        })
+
+    # Delete specific CPD row
+    m_del_cpd = re.search(r"delete\s+demand\s+for\s+([A-Za-z0-9\-\s_]+)\s+at\s+([A-Za-z0-9\-\s_]+)(?:\s+in\s+(20\d{2}))?", text, re.I)
+    if m_del_cpd:
+        prod, cust, yr = m_del_cpd.groups()
+        period = int(yr) if yr else s["period"]
+        s["deletes"]["customer_product_rows"].append({"product": prod.strip(), "customer": cust.strip(), "location": cust.strip(), "period": period})
 
     return s
