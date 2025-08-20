@@ -1,144 +1,221 @@
-from __future__ import annotations
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 import pandas as pd
 
-DEFAULT_PERIOD = 2023
-
-def _ensure_sheet(dfs: Dict[str, pd.DataFrame], name: str, cols: List[str]) -> pd.DataFrame:
-    df = dfs.get(name, pd.DataFrame())
-    if df.empty:
+def _ensure_df(dfs: Dict[str, pd.DataFrame], name: str, cols: List[str]) -> pd.DataFrame:
+    df = dfs.get(name)
+    if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(columns=cols)
-    # ensure columns exist
+        dfs[name] = df
+    # ensure all columns exist
     for c in cols:
         if c not in df.columns:
             df[c] = None
     return df
 
-def _first_uom(cpd: pd.DataFrame, product: str) -> str:
-    if "UOM" in cpd.columns:
-        m = cpd[cpd["Product"] == product]["UOM"].dropna().astype(str)
-        if not m.empty:
-            return m.iloc[0]
-    return "each"
-
-def apply_scenario_edits(dfs: Dict[str, pd.DataFrame], scenario: Dict[str, Any], default_period: int = DEFAULT_PERIOD) -> Dict[str, pd.DataFrame]:
-    out = {k: v.copy() if isinstance(v, pd.DataFrame) else v for k, v in dfs.items()}
-    period = int(scenario.get("period", default_period))
-
-    # Demand updates -> Customer Product Data
-    cpd = _ensure_sheet(out, "Customer Product Data", ["Product","Customer","Location","Period","UOM","Demand","Lead Time","Variable Cost"])
-    for upd in scenario.get("demand_updates", []):
-        p = upd["product"]; c = upd["customer"]; loc = upd.get("location", c)
-        mask = (cpd["Product"] == p) & (cpd["Customer"] == c) & (cpd["Location"] == loc) & (cpd["Period"].fillna(period) == period)
-        if not mask.any():
-            # create row with sensible defaults
-            newrow = {"Product": p, "Customer": c, "Location": loc, "Period": period, "UOM": _first_uom(cpd, p), "Demand": 0}
-            cpd = pd.concat([cpd, pd.DataFrame([newrow])], ignore_index=True)
-            mask = (cpd["Product"] == p) & (cpd["Customer"] == c) & (cpd["Location"] == loc) & (cpd["Period"] == period)
-        # apply delta
-        cur = float(pd.to_numeric(cpd.loc[mask, "Demand"], errors="coerce").fillna(0.0).iloc[0])
-        delta = float(upd.get("delta_pct", 0.0))
-        newd = round(cur * (1.0 + delta/100.0))
-        cpd.loc[mask, "Demand"] = newd
-        # set extras
-        for k, v in (upd.get("set", {}) or {}).items():
-            if k not in cpd.columns:
-                cpd[k] = None
-            cpd.loc[mask, k] = v
-    out["Customer Product Data"] = cpd
-
-    # Warehouse changes
-    wh = _ensure_sheet(out, "Warehouse", ["Warehouse","Location","Period","Available (Warehouse)","Minimum Capacity","Maximum Capacity","Fixed Cost","Variable Cost","Force Open","Force Close"])
-    for ch in scenario.get("warehouse_changes", []):
-        w = ch["warehouse"]; field = ch["field"]; val = ch["new_value"]
-        mask = wh["Warehouse"] == w
-        if not mask.any():
-            # create bare warehouse row
-            newrow = {"Warehouse": w, "Location": w, "Period": period}
-            wh = pd.concat([wh, pd.DataFrame([newrow])], ignore_index=True)
-            mask = wh["Warehouse"] == w
-        if field not in wh.columns:
-            wh[field] = None
-        wh.loc[mask, field] = val
-        # force mutual exclusivity
-        if field == "Force Close" and int(val) == 1:
-            if "Force Open" not in wh.columns: wh["Force Open"] = 0
-            wh.loc[mask, "Force Open"] = 0
-        if field == "Force Open" and int(val) == 1:
-            if "Force Close" not in wh.columns: wh["Force Close"] = 0
-            wh.loc[mask, "Force Close"] = 0
-    out["Warehouse"] = wh
-
-    # Supplier changes
-    sp = _ensure_sheet(out, "Supplier Product", ["Product","Supplier","Location","Period","Available"])
-    for ch in scenario.get("supplier_changes", []):
-        p = ch["product"]; s = ch["supplier"]; loc = ch.get("location", s); field = ch["field"]; val = ch["new_value"]
-        mask = (sp["Product"] == p) & (sp["Supplier"] == s) & (sp["Location"] == loc) & (sp["Period"].fillna(period) == period)
-        if not mask.any():
-            newrow = {"Product": p, "Supplier": s, "Location": loc, "Period": period, field: val}
-            sp = pd.concat([sp, pd.DataFrame([newrow])], ignore_index=True)
+def _upsert(df: pd.DataFrame, match: Dict[str, Any], updates: Dict[str, Any]) -> pd.DataFrame:
+    if df is None:
+        return df
+    if df.empty:
+        row = {**{c: None for c in df.columns}, **match, **updates}
+        return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    mask = pd.Series([True] * len(df))
+    for k, v in match.items():
+        if k in df.columns:
+            mask &= (df[k].astype(str) == str(v))
         else:
-            if field not in sp.columns:
-                sp[field] = None
-            sp.loc[mask, field] = val
-    out["Supplier Product"] = sp
+            df[k] = None
+            mask &= (df[k].astype(str) == str(v))
+    idx = df.index[mask] if mask.any() else []
+    if len(idx) == 0:
+        row = {**{c: None for c in df.columns}, **match, **updates}
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        for i in idx:
+            for k, v in updates.items():
+                if k not in df.columns:
+                    df[k] = None
+                df.at[i, k] = v
+    return df
 
-    # Transport updates
-    tc = _ensure_sheet(out, "Transport Cost", ["Mode of Transport","Product","From Location","To Location","Period","UOM","Available","Retrieve Distance","Average Load Size","Cost Per UOM","Cost per Distance","Cost per Trip","Minimum Cost Per Trip"])
+def _delete_rows(df: pd.DataFrame, match: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    mask = pd.Series([True] * len(df))
+    for k, v in match.items():
+        if k in df.columns:
+            mask &= (df[k].astype(str) == str(v))
+        else:
+            # If column missing, nothing to delete for that criterion
+            mask &= False
+    keep = df[~mask]
+    return keep.reset_index(drop=True)
+
+def apply_scenario(dfs_in: Dict[str, pd.DataFrame], scenario: Dict[str, Any], allow_delete: bool = True) -> Dict[str, pd.DataFrame]:
+    dfs = {k: v.copy() for k, v in dfs_in.items()}
+    period = int(scenario.get("period", 2023))
+
+    # ===== Adds (create rows) =====
+    adds = scenario.get("adds") or {}
+
+    # Add customers
+    cu = _ensure_df(dfs, "Customers", ["Customer","Location"])
+    for c in adds.get("customers", []):
+        match = {"Customer": c["customer"]}
+        updates = {"Location": c.get("location", c["customer"])}
+        cu = _upsert(cu, match, updates)
+    dfs["Customers"] = cu
+
+    # Add customer demand rows
+    cpd = _ensure_df(dfs, "Customer Product Data", ["Product","Customer","Location","Period","UOM","Demand","Lead Time","Variable Cost"])
+    for d in adds.get("customer_demands", []):
+        match = {"Product": d["product"], "Customer": d["customer"], "Location": d.get("location", d["customer"]), "Period": int(d.get("period", period))}
+        updates = {"UOM": "Each", "Demand": float(d.get("demand", 0))}
+        if d.get("lead_time") is not None:
+            updates["Lead Time"] = float(d["lead_time"])
+        cpd = _upsert(cpd, match, updates)
+    dfs["Customer Product Data"] = cpd
+
+    # Add warehouses
+    wh = _ensure_df(dfs, "Warehouse", ["Warehouse","Location","Period","Available (Warehouse)","Minimum Capacity","Maximum Capacity","Fixed Cost","Variable Cost","Force Open","Force Close"])
+    for w in adds.get("warehouses", []):
+        match = {"Warehouse": w["warehouse"]}
+        if "Period" in wh.columns:
+            match["Period"] = period
+        updates = {"Location": w.get("location", w["warehouse"])}
+        fields = w.get("fields") or {}
+        updates.update(fields)
+        if "Available (Warehouse)" not in updates:
+            updates["Available (Warehouse)"] = 1
+        wh = _upsert(wh, match, updates)
+    dfs["Warehouse"] = wh
+
+    # Add supplier products
+    sp = _ensure_df(dfs, "Supplier Product", ["Product","Supplier","Location","Step","Period","UOM","Available"])
+    for s in adds.get("supplier_products", []):
+        match = {"Product": s["product"], "Supplier": s["supplier"], "Location": s.get("location", s["supplier"]), "Period": int(s.get("period", period))}
+        updates = s.get("fields", {}) or {}
+        if "Available" not in updates:
+            updates["Available"] = 1
+        sp = _upsert(sp, match, updates)
+    dfs["Supplier Product"] = sp
+
+    # Add transport lanes
+    tc = _ensure_df(dfs, "Transport Cost", ["Mode of Transport","Product","From Location","To Location","Period","UOM","Available","Retrieve Distance","Average Load Size","Cost Per UOM","Cost per Distance","Cost per Trip","Minimum Cost Per Trip"])
+    for t in adds.get("transport_lanes", []):
+        match = {
+            "Mode of Transport": t["mode"],
+            "Product": t["product"],
+            "From Location": t["from_location"],
+            "To Location": t["to_location"],
+            "Period": int(t.get("period", period)),
+        }
+        updates = t.get("fields", {}) or {}
+        if "UOM" not in updates:
+            updates["UOM"] = "Each"
+        if "Available" not in updates:
+            updates["Available"] = 1
+        tc = _upsert(tc, match, updates)
+    dfs["Transport Cost"] = tc
+
+    # ===== Updates (existing sections) =====
+
+    # Demand updates (pct)
+    for d in scenario.get("demand_updates", []):
+        prod = d["product"]; cust = d["customer"]; loc = d.get("location", cust)
+        uom = "Each"
+        if "UOM" in cpd.columns:
+            found = cpd[(cpd["Product"].astype(str)==prod) & (cpd["Customer"].astype(str)==cust)]
+            if not found.empty and "UOM" in found.columns and pd.notna(found.iloc[0].get("UOM")):
+                uom = found.iloc[0]["UOM"]
+        match = {"Product": prod, "Customer": cust, "Location": loc, "Period": period}
+        existing = cpd[(cpd["Product"].astype(str)==prod) & (cpd["Customer"].astype(str)==cust) &
+                       (cpd["Location"].astype(str)==loc) & (cpd["Period"].astype(int)==period)]
+        base = float(existing.iloc[0]["Demand"]) if not existing.empty and pd.notna(existing.iloc[0].get("Demand")) else 0.0
+        if "delta_pct" in d and d["delta_pct"] is not None:
+            new_val = round(base * (1.0 + float(d["delta_pct"])/100.0))
+        else:
+            new_val = base
+        updates = {"UOM": uom, "Demand": new_val}
+        if "set" in d and isinstance(d["set"], dict):
+            updates.update(d["set"])
+        cpd = _upsert(cpd, match, updates)
+    dfs["Customer Product Data"] = cpd
+
+    # Warehouse field updates
+    for w in scenario.get("warehouse_changes", []):
+        match = {"Warehouse": w["warehouse"]}
+        if "Period" in wh.columns:
+            match["Period"] = period
+        updates = {w["field"]: w["new_value"]}
+        if w["field"] == "Force Close" and int(w["new_value"]) == 1:
+            updates["Force Open"] = 0
+        if w["field"] == "Force Open" and int(w["new_value"]) == 1:
+            updates["Force Close"] = 0
+        wh = _upsert(wh, match, updates)
+    dfs["Warehouse"] = wh
+
+    # Supplier changes (e.g., Available)
+    for srow in scenario.get("supplier_changes", []):
+        match = {"Product": srow["product"], "Supplier": srow["supplier"], "Location": srow["location"], "Period": period}
+        updates = {srow["field"]: srow["new_value"]}
+        sp = _upsert(sp, match, updates)
+    dfs["Supplier Product"] = sp
+
+    # Transport updates (cost, available, etc.)
     for t in scenario.get("transport_updates", []):
-        mode = t["mode"]; prod = t["product"]; fr = t["from_location"]; to = t["to_location"]; p = int(t.get("period", period))
-        fields = t.get("fields", {})
-        mask = (tc["Mode of Transport"] == mode) & (tc["Product"] == prod) & (tc["From Location"] == fr) & (tc["To Location"] == to) & (tc["Period"].fillna(p) == p)
-        if not mask.any():
-            newrow = {"Mode of Transport": mode, "Product": prod, "From Location": fr, "To Location": to, "Period": p}
-            for k, v in fields.items(): newrow[k] = v
-            tc = pd.concat([tc, pd.DataFrame([newrow])], ignore_index=True)
-        else:
-            for k, v in fields.items():
-                if k not in tc.columns:
-                    tc[k] = None
-                tc.loc[mask, k] = v
-    out["Transport Cost"] = tc
+        match = {
+            "Mode of Transport": t["mode"],
+            "Product": t["product"],
+            "From Location": t["from_location"],
+            "To Location": t["to_location"],
+            "Period": int(t.get("period", period)),
+        }
+        updates = t.get("fields", {})
+        if "Available" not in updates:
+            updates["Available"] = 1
+        if "UOM" not in updates:
+            updates["UOM"] = "Each"
+        tc = _upsert(tc, match, updates)
+    dfs["Transport Cost"] = tc
 
-    return out
+    # ===== Deletes (if allowed) =====
+    if allow_delete:
+        dels = scenario.get("deletes") or {}
 
-def _diff_df(before: pd.DataFrame, after: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
-    if before is None: before = pd.DataFrame(columns=keys)
-    if after is None: after = pd.DataFrame(columns=keys)
-    b = before.copy(); a = after.copy()
-    for df in (b, a):
-        df.columns = [str(c) for c in df.columns]
-    # outer merge to catch inserts/deletes
-    merged = b.merge(a, how="outer", on=keys, suffixes=("_before", "_after"), indicator=True)
-    # For non-key columns present in both frames, show only changes
-    out_rows = []
-    for _, row in merged.iterrows():
-        if row["_merge"] == "both":
-            for col in a.columns:
-                if col in keys: continue
-                before_val = row.get(f"{col}_before", None)
-                after_val = row.get(f"{col}_after", None)
-                if (pd.isna(before_val) and pd.isna(after_val)) or (before_val == after_val):
-                    continue
-                out_rows.append({**{k: row[k] for k in keys}, "Field": col, "Before": before_val, "After": after_val})
-        elif row["_merge"] == "left_only":
-            out_rows.append({**{k: row[k] for k in keys}, "Field": "__row__", "Before": "present", "After": "deleted"})
-        elif row["_merge"] == "right_only":
-            out_rows.append({**{k: row[k] for k in keys}, "Field": "__row__", "Before": "missing", "After": "added"})
-    return pd.DataFrame(out_rows)
+        # Delete customer product rows
+        for d in dels.get("customer_product_rows", []):
+            match = {
+                "Product": d["product"], "Customer": d["customer"],
+                "Location": d.get("location", d["customer"]), "Period": int(d.get("period", period))
+            }
+            cpd = _delete_rows(cpd, match)
+        dfs["Customer Product Data"] = cpd
 
-def diff_tables(before: Dict[str, pd.DataFrame], after: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    out["Customer Product Data"] = _diff_df(before.get("Customer Product Data", pd.DataFrame()),
-                                            after.get("Customer Product Data", pd.DataFrame()),
-                                            ["Product","Customer","Location","Period"])
-    out["Warehouse"] = _diff_df(before.get("Warehouse", pd.DataFrame()),
-                                after.get("Warehouse", pd.DataFrame()),
-                                ["Warehouse"])
-    out["Supplier Product"] = _diff_df(before.get("Supplier Product", pd.DataFrame()),
-                                       after.get("Supplier Product", pd.DataFrame()),
-                                       ["Product","Supplier","Location","Period"])
-    out["Transport Cost"] = _diff_df(before.get("Transport Cost", pd.DataFrame()),
-                                     after.get("Transport Cost", pd.DataFrame()),
-                                     ["Mode of Transport","Product","From Location","To Location","Period"])
-    return out
+        # Delete customers
+        for c in dels.get("customers", []):
+            cu = _delete_rows(cu, {"Customer": c["customer"]})
+        dfs["Customers"] = cu
+
+        # Delete warehouses
+        for w in dels.get("warehouses", []):
+            wh = _delete_rows(wh, {"Warehouse": w["warehouse"]})
+        dfs["Warehouse"] = wh
+
+        # Delete supplier products
+        for sdel in dels.get("supplier_products", []):
+            sp = _delete_rows(sp, {"Product": sdel["product"], "Supplier": sdel["supplier"]})
+        dfs["Supplier Product"] = sp
+
+        # Delete transport lanes
+        for tdel in dels.get("transport_lanes", []):
+            match = {
+                "Mode of Transport": tdel["mode"],
+                "Product": tdel["product"],
+                "From Location": tdel["from_location"],
+                "To Location": tdel["to_location"],
+                "Period": int(tdel.get("period", period)),
+            }
+            tc = _delete_rows(tc, match)
+        dfs["Transport Cost"] = tc
+
+    return dfs
