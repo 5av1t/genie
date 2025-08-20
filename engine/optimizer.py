@@ -56,7 +56,7 @@ def run_optimizer(dfs: Dict[str, pd.DataFrame], period: int = DEFAULT_PERIOD) ->
     if cpd is None or wh is None or tc is None:
         return {"status": "missing_data"}, {"note": "Required sheets missing", "flows": []}
 
-    # Demand (period filter)
+    # Demand for selected period
     cpd_use = cpd.copy()
     if "Period" in cpd_use.columns:
         cpd_use = cpd_use[cpd_use["Period"] == period]
