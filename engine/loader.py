@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Tuple, Any
 import pandas as pd
 
 DEFAULT_PERIOD = 2023
@@ -12,7 +12,7 @@ REQ = {
     "Products": ["Product"],
     "Supplier Product": ["Product", "Supplier", "Location", "Period", "Available"],
     "Mode of Transport": ["Mode of Transport"],
-    "Periods": ["Start Date", "End Date"],  # we'll accept either Period or Year fields too
+    "Periods": ["Start Date", "End Date"],  # permissive; we coerce Period elsewhere
 }
 
 ALIAS_MAP = {
@@ -26,23 +26,15 @@ ALIAS_MAP = {
     "mode of transport": "Mode of Transport",
 }
 
-
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
-    # Basic strip
     ren = {}
     for c in df.columns:
         c2 = c.strip()
         low = c2.lower()
-        if low in ALIAS_MAP:
-            ren[c] = ALIAS_MAP[low]
-        else:
-            # Title‑ish capitalization for consistent matching
-            ren[c] = c2
-    df = df.rename(columns=ren)
-    return df
-
+        ren[c] = ALIAS_MAP.get(low, c2)
+    return df.rename(columns=ren)
 
 def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     # Customer Product Data
@@ -59,7 +51,6 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     # Warehouse
     wh = dfs.get("Warehouse")
     if isinstance(wh, pd.DataFrame) and not wh.empty:
-        # ensure availability flag column exists
         if "Available (Warehouse)" not in wh.columns:
             wh["Available (Warehouse)"] = 1
         for col in ["Minimum Capacity", "Maximum Capacity", "Fixed Cost", "Variable Cost", "Force Open", "Force Close", "Available (Warehouse)"]:
@@ -74,9 +65,8 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     if isinstance(sp, pd.DataFrame) and not sp.empty:
         if "Period" not in sp.columns:
             sp["Period"] = DEFAULT_PERIOD
-        for col in ["Available"]:
-            if col in sp.columns:
-                sp[col] = pd.to_numeric(sp[col], errors="coerce")
+        if "Available" in sp.columns:
+            sp["Available"] = pd.to_numeric(sp["Available"], errors="coerce")
         sp["Period"] = pd.to_numeric(sp["Period"], errors="coerce").fillna(DEFAULT_PERIOD).astype(int)
         dfs["Supplier Product"] = sp
 
@@ -93,7 +83,6 @@ def _coerce_types(dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
 
     return dfs
 
-
 def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
     report: Dict[str, Any] = {}
     for sheet, req_cols in REQ.items():
@@ -109,7 +98,7 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             "sheet_missing": False,
         }
 
-    # Simple warnings
+    # Warnings
     warn = []
 
     # Negative capacities
@@ -126,26 +115,20 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         if not npd.empty:
             warn.append(f"Customer Product Data: {len(npd)} row(s) with non-positive Demand.")
 
-    
-    # Orphan lanes
+    # Orphan lanes: From must be Warehouse.Location; To can be Customers.Customer OR CPD.Customer/Location
     tc = dfs.get("Transport Cost")
     if isinstance(tc, pd.DataFrame) and not tc.empty:
-        wh = dfs.get("Warehouse")
         wh_locs = set()
         if isinstance(wh, pd.DataFrame) and not wh.empty and "Location" in wh.columns:
             wh_locs = set(str(x) for x in wh["Location"].dropna().unique())
 
-        # Build valid customer targets from Customers OR CPD
         cust_names = set()
         custs = dfs.get("Customers")
         if isinstance(custs, pd.DataFrame) and not custs.empty and "Customer" in custs.columns:
             cust_names |= set(str(x) for x in custs["Customer"].dropna().unique())
-
-        cpd = dfs.get("Customer Product Data")
         if isinstance(cpd, pd.DataFrame) and not cpd.empty:
             if "Customer" in cpd.columns:
                 cust_names |= set(str(x) for x in cpd["Customer"].dropna().unique())
-            # Some models use CPD.Location as the “to” token; include it as valid too
             if "Location" in cpd.columns:
                 cust_names |= set(str(x) for x in cpd["Location"].dropna().unique())
 
@@ -160,12 +143,12 @@ def _validate(dfs: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                 orphan_to += 1
         if orphan_from or orphan_to:
             warn.append(
-                f"Transport Cost: orphan lanes — "
-                f"From not in Warehouse.Location: {orphan_from}, "
+                f"Transport Cost: orphan lanes — From not in Warehouse.Location: {orphan_from}, "
                 f"To not in Customers/CPD: {orphan_to}"
             )
 
-
+    report["_warnings"] = warn
+    return report
 
 def load_excel(file_like) -> Dict[str, pd.DataFrame]:
     xls = pd.ExcelFile(file_like)
@@ -176,7 +159,6 @@ def load_excel(file_like) -> Dict[str, pd.DataFrame]:
         dfs[name] = df
     dfs = _coerce_types(dfs)
     return dfs
-
 
 def load_and_validate_excel(file_like) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
     dfs = load_excel(file_like)
