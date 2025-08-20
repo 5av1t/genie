@@ -1,202 +1,211 @@
-from __future__ import annotations
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 import os
-import pandas as pd
+import json
+import math
+import re
 
-# Optional: only needed if you enable online geocoding fallback in suggest_location_candidates
+# Optional providers
 try:
-    import requests  # Streamlit Cloud generally allows outbound; if blocked, we handle gracefully
-except Exception:  # keep module import-safe
-    requests = None  # type: ignore
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
-# Reuse your deterministic parser to avoid hallucinations for now
-from engine.parser import parse_rules, DEFAULT_PERIOD
-# Use geo helpers for offline coord resolution
-from engine import geo as geo_mod
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-
-# -----------------------------------------------------------------------------
-# LLM parsing shim: keep deterministic by routing to rules (safe & grounded)
-# -----------------------------------------------------------------------------
-def parse_with_llm(
-    text: str,
-    dfs: Dict[str, pd.DataFrame],
-    default_period: int = DEFAULT_PERIOD,
-    provider: str = "none",
-) -> Dict[str, Any]:
+# ===== Existing functions kept for compatibility =====
+def parse_with_llm(prompt: str, dfs: Dict[str, Any], default_period: int = 2023, provider: str = "gemini") -> Dict[str, Any]:
     """
-    For stability, we map NL -> scenario JSON using the deterministic rules parser.
-    Later, you can replace this with real Gemini parsing, but ALWAYS post-validate
-    entities against what's present in `dfs` (products/customers/warehouses/modes).
+    NL → Scenario JSON. Keep your existing impl if you have one; this stub keeps the app running.
     """
-    return parse_rules(text, dfs, default_period=default_period)
+    return {"period": default_period}
 
-
-# -----------------------------------------------------------------------------
-# Q&A: grounded summaries over the loaded model and solver diagnostics
-# -----------------------------------------------------------------------------
-def _unserved_pairs(diag: Dict[str, Any], dfs: Dict[str, pd.DataFrame]) -> List[str]:
-    flows = diag.get("flows", [])
-    served = {(f.get("customer"), f.get("product")) for f in flows}
-    cpd = dfs.get("Customer Product Data", pd.DataFrame()).copy()
-    if cpd.empty:
-        return []
-    cpd["Demand"] = pd.to_numeric(cpd.get("Demand", 0), errors="coerce").fillna(0.0)
-    cpd = cpd[cpd["Demand"] > 0]
+def summarize_scenario(scn: Dict[str, Any]) -> List[str]:
     out = []
-    for _, r in cpd.iterrows():
-        key = (str(r.get("Customer")), str(r.get("Product")))
-        if key not in served:
-            out.append(f"{key[0]} ({key[1]})")
-    return sorted(set(out))
+    if not scn:
+        return ["No scenario changes parsed."]
+    if "period" in scn:
+        out.append(f"Period: {scn['period']}")
+    for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
+        if scn.get(k):
+            out.append(f"{len(scn[k])} {k.replace('_',' ')}")
+    if scn.get("adds"):    out.append("Includes additions.")
+    if scn.get("deletes"): out.append("Includes deletions.")
+    return out
 
+# ===== Results Q&A =====
 
-def answer_question(
-    question: str,
-    kpis: Dict[str, Any],
-    diag: Dict[str, Any],
-    provider: str = "none",
-    dfs: Dict[str, pd.DataFrame] = None,
-    model_index: Dict[str, Any] = None,
-) -> str:
-    """
-    Lightweight, reliable answers based on your data (no hallucinations).
-    Extend with Gemini later by passing compact structured context.
-    """
-    q = (question or "").strip().lower()
-    if not q:
-        return "Please ask a question about the model or solution."
+SYSTEM_QA_INSTRUCTIONS = """
+You are GENIE, a supply chain network design assistant.
+Answer using the structured context provided (KPIs, flows, throughput, caps).
+Do not invent products or entities. If the data is missing, say so briefly.
+Keep answers concise, show top items with values, and one-line reasoning.
+"""
 
-    # Unserved demand pairs
-    if "unserved" in q or "not served" in q:
-        un = _unserved_pairs(diag, dfs or {})
-        if un:
-            return "Unserved customer–product pairs:\n- " + "\n- ".join(un)
-        return "All demanded customer–product pairs appear served in the current solution."
-
-    # Lowest demand customer (aggregated)
-    if "least demand" in q or "lowest demand" in q:
-        cpd = (dfs or {}).get("Customer Product Data", pd.DataFrame()).copy()
-        if cpd.empty:
-            return "I can't find demand data."
-        cpd["Demand"] = pd.to_numeric(cpd.get("Demand", 0), errors="coerce").fillna(0.0)
-        grp = cpd.groupby("Customer")["Demand"].sum().sort_values()
-        if grp.empty:
-            return "No demand rows found."
-        c, d = grp.index[0], grp.iloc[0]
-        return f"Lowest aggregated demand by customer: {c} = {int(d)} units."
-
-    # KPI summary
-    if "kpi" in q or "status" in q or "service" in q:
-        return f"Status: {kpis.get('status')}, Service: {kpis.get('service_pct')}%, Total Cost: {kpis.get('total_cost')}."
-
-    # Default help
-    return (
-        "I can answer grounded questions about unserved pairs, KPIs, and basic demand summaries. "
-        "Try: 'Which customers are unserved?' or 'What is the total cost and service %?'"
-    )
-
-
-# -----------------------------------------------------------------------------
-# Location suggestions for geocoding / upserting into Locations sheet
-# -----------------------------------------------------------------------------
-def _locations_sheet(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    for name in ["Locations", "locations", "Geo", "Coordinates"]:
-        df = dfs.get(name)
-        if isinstance(df, pd.DataFrame) and {"Location", "Latitude", "Longitude"}.issubset(set(df.columns)):
-            return df.copy()
-    return pd.DataFrame(columns=["Location", "Latitude", "Longitude"])
-
-
-def _try_online_geocode(q: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Optional online lookup via Nominatim (OpenStreetMap). Only used if allow_online=True."""
-    if requests is None:
-        return []
+def _gemini_client():
+    if genai is None: return None
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key: return None
+    genai.configure(api_key=api_key)
     try:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {"q": q, "format": "json", "limit": str(limit)}
-        headers = {"User-Agent": "genie-network-app/1.0"}
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        if not r.ok:
-            return []
-        data = r.json()
-        out = []
-        for item in data:
-            try:
-                lat = float(item.get("lat"))
-                lon = float(item.get("lon"))
-                name = item.get("display_name") or q
-                out.append({"name": name, "lat": lat, "lon": lon, "source": "online"})
-            except Exception:
-                continue
-        return out
+        return genai.GenerativeModel("gemini-1.5-flash")
     except Exception:
-        return []
+        return None
 
+def _openai_client():
+    if OpenAI is None: return None
+    if not os.getenv("OPENAI_API_KEY"): return None
+    try:
+        return OpenAI()
+    except Exception:
+        return None
 
-def suggest_location_candidates(
-    query: str,
-    dfs: Dict[str, pd.DataFrame],
-    provider: str = "none",
-    allow_online: bool = False,
-    limit: int = 5,
-) -> List[Dict[str, Any]]:
+def _fmt_top(items, limit=5):
+    lines = []
+    for i, row in enumerate(items[:limit], 1):
+        if isinstance(row, (list, tuple)):
+            lines.append(f"{i}. " + ", ".join(map(str, row)))
+        elif isinstance(row, dict):
+            lines.append(f"{i}. " + ", ".join(f"{k}={v}" for k, v in row.items()))
+        else:
+            lines.append(f"{i}. {row}")
+    return "\n".join(lines) if lines else "—"
+
+def _safe_float(x, default=0.0):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+def _grounded_answer(question: str, kpis: Dict[str, Any], diag: Dict[str, Any], dfs: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    Returns up to `limit` coordinate candidates for `query`:
-      1) Exact/contains matches in the Locations sheet
-      2) Offline resolver (engine.geo.resolve_latlon incl. 'City_XYZ' prefix)
-      3) Optional online Nominatim suggestions (if allow_online=True)
+    Deterministic answers for common queries. Returns string if handled; else None.
     """
-    q = (query or "").strip()
-    out: List[Dict[str, Any]] = []
-    if not q:
-        return out
+    q = (question or "").lower().strip()
 
-    # 1) Locations sheet — exact, then substring
-    locs = _locations_sheet(dfs)
-    if not locs.empty:
-        # exact
-        m_exact = locs[locs["Location"].astype(str).str.lower() == q.lower()]
-        for _, r in m_exact.head(limit).iterrows():
-            try:
-                out.append({"name": str(r["Location"]), "lat": float(r["Latitude"]), "lon": float(r["Longitude"]), "source": "locations"})
-            except Exception:
-                pass
-        # contains
-        if len(out) < limit:
-            m_cont = locs[locs["Location"].astype(str).str.lower().str.contains(q.lower(), na=False)]
-            for _, r in m_cont.head(limit - len(out)).iterrows():
-                try:
-                    cand = {"name": str(r["Location"]), "lat": float(r["Latitude"]), "lon": float(r["Longitude"]), "source": "locations"}
-                    if cand not in out:
-                        out.append(cand)
-                except Exception:
-                    pass
+    flows = diag.get("flows", []) if isinstance(diag, dict) else []
+    wh_thr = diag.get("warehouse_throughput", {}) if isinstance(diag, dict) else {}
+    lane_top = diag.get("lane_flow_top", []) if isinstance(diag, dict) else []
+    binding = diag.get("binding_warehouses", []) if isinstance(diag, dict) else []
+    caps = diag.get("cap_by_warehouse", {}) if isinstance(diag, dict) else {}
 
-    # 2) Offline resolver (uses known cities and prefix-before-underscore)
-    if len(out) < limit:
-        lat, lon = geo_mod.resolve_latlon(q, ext=None)
-        if lat is not None and lon is not None:
-            out.append({"name": q, "lat": float(lat), "lon": float(lon), "source": "offline"})
-        if "_" in q and len(out) < limit:
-            base = q.split("_")[0]
-            lat2, lon2 = geo_mod.resolve_latlon(base, ext=None)
-            if lat2 is not None and lon2 is not None:
-                cand = {"name": base, "lat": float(lat2), "lon": float(lon2), "source": "offline"}
-                if cand not in out:
-                    out.append(cand)
+    # 0) No flows case
+    if any(x in q for x in ["flow", "throughput", "lane", "route"]) and len(flows) == 0:
+        status = (kpis or {}).get("status")
+        if status in {"no_feasible_arcs","no_demand","no_positive_demand","no_transport_cost"}:
+            return f"No flows available (status: {status}). Add/enable lanes, ensure demand > 0, and warehouses have capacity."
+        # else keep going; maybe question is about demand/cost
 
-    # 3) Online (optional)
-    if allow_online and len(out) < limit:
-        out.extend(_try_online_geocode(q, limit=limit - len(out)))
+    # 1) service level / total cost
+    if re.search(r"(service|fill)\s*(level|rate)|serv(ed|ice)", q):
+        return f"Service level: {(kpis or {}).get('service_pct', 0)}% (served {(kpis or {}).get('served', 0)} of {(kpis or {}).get('total_demand', 0)})."
+    if "total cost" in q or re.search(r"\bcost\b", q) and "unit" not in q:
+        tc = (kpis or {}).get("total_cost")
+        return f"Total transport cost: {tc if tc is not None else 'N/A'}."
 
-    # Deduplicate
-    seen = set()
-    uniq: List[Dict[str, Any]] = []
-    for c in out:
-        key = (c["name"], round(c["lat"], 6), round(c["lon"], 6))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(c)
+    # 2) lowest / highest throughput warehouse
+    if "lowest" in q and "throughput" in q:
+        if not wh_thr:
+            return "No warehouse throughput computed (no flows)."
+        wh_sorted = sorted(wh_thr.items(), key=lambda kv: _safe_float(kv[1]))
+        top = [(w, round(_safe_float(qty),2)) for w, qty in wh_sorted[:5]]
+        return "Lowest‑throughput warehouses:\n" + _fmt_top(top)
+    if "highest" in q and "throughput" in q:
+        if not wh_thr:
+            return "No warehouse throughput computed (no flows)."
+        wh_sorted = sorted(wh_thr.items(), key=lambda kv: _safe_float(kv[1]), reverse=True)
+        top = [(w, round(_safe_float(qty),2)) for w, qty in wh_sorted[:5]]
+        return "Highest‑throughput warehouses:\n" + _fmt_top(top)
 
-    return uniq[:limit]
+    # 3) top lanes by flow
+    if re.search(r"top\s+\d*\s*lanes", q) or ("top" in q and "lane" in q) or ("lanes" in q and "top" in q):
+        if not lane_top:
+            return "No lane flows available."
+        topn = []
+        for w, c, qv in lane_top[:10]:
+            topn.append((w, c, round(_safe_float(qv), 2)))
+        return "Top lanes by flow (warehouse → customer, qty):\n" + _fmt_top(topn)
+
+    # 4) binding capacity / bottlenecks
+    if "bottleneck" in q or "binding" in q or ("capacity" in q and ("bind" in q or "tight" in q)):
+        if not binding:
+            return "No binding warehouses detected."
+        rows = []
+        for b in binding:
+            rows.append((b.get("warehouse"), round(_safe_float(b.get("used")),2), round(_safe_float(b.get("capacity")),2)))
+        return "Binding (near‑full) warehouses (name, used, capacity):\n" + _fmt_top(rows)
+
+    # 5) capacity of a specific warehouse
+    m = re.search(r"capacity\s+of\s+([A-Za-z0-9_\-]+)", q)
+    if m:
+        w = m.group(1)
+        if w in caps:
+            return f"Capacity of {w}: {round(_safe_float(caps[w]),2)}"
+        return f"No capacity entry found for {w}."
+
+    # 6) which customer received most flow
+    if ("customer" in q and ("most" in q or "highest" in q) and "flow" in q) or "top customers" in q:
+        if not flows:
+            return "No flows computed."
+        by_cust = {}
+        for f in flows:
+            by_cust[f["customer"]] = by_cust.get(f["customer"], 0.0) + _safe_float(f.get("qty"), 0.0)
+        topc = sorted(by_cust.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        topc = [(c, round(v,2)) for c, v in topc]
+        return "Top customers by received qty:\n" + _fmt_top(topc)
+
+    # Not handled
+    return None
+
+def answer_question(question: str, kpis: Dict[str, Any], diag: Dict[str, Any], provider: str = "gemini", dfs: Optional[Dict[str, Any]] = None, force_llm: bool = False) -> str:
+    """
+    Q&A about results. Tries grounded (no LLM) first for common queries.
+    If force_llm=True (or grounded didn't handle), call LLM if configured.
+    """
+    # 1) try grounded first
+    ans = _grounded_answer(question, kpis, diag, dfs=dfs)
+    if ans is not None and not force_llm:
+        return ans
+
+    # 2) build compact context for LLM
+    ctx = {
+        "kpis": kpis or {},
+        "flows": (diag or {}).get("flows", []),
+        "lowest_throughput_warehouses": (diag or {}).get("lowest_throughput_warehouses", []),
+        "binding_warehouses": (diag or {}).get("binding_warehouses", []),
+        "lane_flow_top": (diag or {}).get("lane_flow_top", []),
+        "warehouse_throughput": (diag or {}).get("warehouse_throughput", {}),
+        "cap_by_warehouse": (diag or {}).get("cap_by_warehouse", {}),
+    }
+    ctx_text = json.dumps(ctx, indent=2, sort_keys=True)
+
+    # 3) pick provider
+    if provider == "openai":
+        client = _openai_client()
+        if client is None:
+            return ans or "OpenAI not configured; also grounded patterns did not match this question."
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.1,
+                messages=[
+                    {"role": "system", "content": SYSTEM_QA_INSTRUCTIONS},
+                    {"role": "user", "content": f"Context:\n{ctx_text}\n\nQuestion: {question}"},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return ans or f"OpenAI error: {e}"
+
+    # default: gemini
+    model = _gemini_client()
+    if model is None:
+        return ans or "Gemini not configured; also grounded patterns did not match this question."
+    try:
+        out = model.generate_content(f"{SYSTEM_QA_INSTRUCTIONS}\n\nContext:\n{ctx_text}\n\nQuestion: {question}")
+        return out.text.strip() if hasattr(out, "text") and out.text else (ans or "No answer.")
+    except Exception as e:
+        return ans or f"Gemini error: {e}"
