@@ -2,7 +2,6 @@ from typing import Dict, Any, List, Optional
 import os, json
 import math
 
-# Optional deps; handled at runtime
 try:
     from openai import OpenAI
 except Exception:
@@ -15,7 +14,6 @@ except Exception:
 
 DEFAULT_PERIOD = 2023
 
-# ---------- Catalog Builders ----------
 def _vals(df, col) -> List[str]:
     if df is None or col not in df.columns:
         return []
@@ -53,13 +51,53 @@ def scenario_schema_json() -> Dict[str, Any]:
             "transport_updates":{"type":"array","items":{"type":"object","properties":{
                 "mode":{"type":"string"},"product":{"type":"string"},"from_location":{"type":"string"},"to_location":{"type":"string"},
                 "period":{"type":"integer"},"fields":{"type":"object","additionalProperties":True}
-            },"required":["mode","product","from_location","to_location","fields"],"additionalProperties":True}}
+            },"required":["mode","product","from_location","to_location","fields"],"additionalProperties":True}},
+            "adds": {
+                "type":"object",
+                "properties": {
+                    "customers":{"type":"array","items":{"type":"object","properties":{
+                        "customer":{"type":"string"},"location":{"type":"string"}
+                    },"required":["customer","location"],"additionalProperties":True}},
+                    "customer_demands":{"type":"array","items":{"type":"object","properties":{
+                        "product":{"type":"string"},"customer":{"type":"string"},"location":{"type":"string"},"period":{"type":"integer"},
+                        "demand":{"type":"number"},"lead_time":{"type":["number","null"]}
+                    },"required":["product","customer","location","period","demand"],"additionalProperties":True}},
+                    "warehouses":{"type":"array","items":{"type":"object","properties":{
+                        "warehouse":{"type":"string"},"location":{"type":"string"},"fields":{"type":"object","additionalProperties":True}
+                    },"required":["warehouse","location"],"additionalProperties":True}},
+                    "supplier_products":{"type":"array","items":{"type":"object","properties":{
+                        "product":{"type":"string"},"supplier":{"type":"string"},"location":{"type":"string"},"period":{"type":"integer"},"fields":{"type":"object","additionalProperties":True}
+                    },"required":["product","supplier","location","period"],"additionalProperties":True}},
+                    "transport_lanes":{"type":"array","items":{"type":"object","properties":{
+                        "mode":{"type":"string"},"product":{"type":"string"},"from_location":{"type":"string"},"to_location":{"type":"string"},
+                        "period":{"type":"integer"},"fields":{"type":"object","additionalProperties":True}
+                    },"required":["mode","product","from_location","to_location","period"],"additionalProperties":True}}
+                },
+                "additionalProperties": False
+            },
+            "deletes": {
+                "type":"object",
+                "properties": {
+                    "customers":{"type":"array","items":{"type":"object","properties":{"customer":{"type":"string"}},"required":["customer"]}},
+                    "customer_product_rows":{"type":"array","items":{"type":"object","properties":{
+                        "product":{"type":"string"},"customer":{"type":"string"},"location":{"type":"string"},"period":{"type":"integer"}
+                    },"required":["product","customer","location","period"]}},
+                    "warehouses":{"type":"array","items":{"type":"object","properties":{"warehouse":{"type":"string"}},"required":["warehouse"]}},
+                    "supplier_products":{"type":"array","items":{"type":"object","properties":{
+                        "product":{"type":"string"},"supplier":{"type":"string"}
+                    },"required":["product","supplier"]}},
+                    "transport_lanes":{"type":"array","items":{"type":"object","properties":{
+                        "mode":{"type":"string"},"product":{"type":"string"},"from_location":{"type":"string"},
+                        "to_location":{"type":"string"},"period":{"type":"integer"}
+                    },"required":["mode","product","from_location","to_location","period"]}}
+                },
+                "additionalProperties": False
+            }
         },
-        "required": ["period","demand_updates","warehouse_changes","supplier_changes","transport_updates"],
+        "required": ["period","demand_updates","warehouse_changes","supplier_changes","transport_updates","adds","deletes"],
         "additionalProperties": False
     }
 
-# ---------- Provider Clients ----------
 def _client_openai():
     key = os.environ.get("OPENAI_API_KEY")
     if not key or OpenAI is None:
@@ -80,17 +118,14 @@ def _client_gemini():
         return None
 
 def _choose_provider(provider: Optional[str] = None) -> str:
-    """Return 'gemini', 'openai', or 'none'."""
     if provider in ("gemini", "openai", "none"):
         return provider
-    # Auto: prefer Gemini if available, then OpenAI
     if _client_gemini() is not None:
         return "gemini"
     if _client_openai() is not None:
         return "openai"
     return "none"
 
-# ---------- Shared JSON LLM helper ----------
 def llm_json(instruction: str, schema: Dict[str, Any], system: Optional[str] = None, provider: Optional[str] = None) -> Optional[Dict[str, Any]]:
     prov = _choose_provider(provider)
 
@@ -132,7 +167,6 @@ def llm_json(instruction: str, schema: Dict[str, Any], system: Optional[str] = N
             txt = resp.text
             return json.loads(txt)
         except Exception:
-            # Fallback: try parsing any JSON substring
             try:
                 import re
                 m = re.search(r"\{.*\}", resp.text, flags=re.S)
@@ -142,11 +176,18 @@ def llm_json(instruction: str, schema: Dict[str, Any], system: Optional[str] = N
                 pass
             return None
 
-    return None  # provider none
+    return None
 
-# ---------- High-level APIs ----------
 def _default_scenario(period:int)->Dict[str,Any]:
-    return {"period": period, "demand_updates": [], "warehouse_changes": [], "supplier_changes": [], "transport_updates": []}
+    return {
+        "period": period,
+        "demand_updates": [],
+        "warehouse_changes": [],
+        "supplier_changes": [],
+        "transport_updates": [],
+        "adds": {"customers": [], "customer_demands": [], "warehouses": [], "supplier_products": [], "transport_lanes": []},
+        "deletes": {"customers": [], "customer_product_rows": [], "warehouses": [], "supplier_products": [], "transport_lanes": []},
+    }
 
 def summarize_scenario(s: Dict[str, Any]) -> List[str]:
     bullets = []
@@ -164,6 +205,32 @@ def summarize_scenario(s: Dict[str, Any]) -> List[str]:
         bullets.append(f"Supplier: {sp.get('supplier')} {sp.get('product')} → {sp.get('field')} = {sp.get('new_value')}")
     for t in s.get("transport_updates", []):
         bullets.append(f"Transport: {t.get('mode')} {t.get('from_location')}→{t.get('to_location')} ({t.get('product')}) {t.get('fields')}")
+    # Adds
+    adds = s.get("adds", {})
+    for c in adds.get("customers", []):
+        bullets.append(f"Add customer {c.get('customer')} at {c.get('location')}")
+    for d in adds.get("customer_demands", []):
+        bullets.append(f"Add demand {d.get('demand')} of {d.get('product')} at {d.get('customer')} (period {d.get('period')})")
+    for w in adds.get("warehouses", []):
+        bullets.append(f"Add warehouse {w.get('warehouse')} at {w.get('location')} {w.get('fields')}")
+    for sp in adds.get("supplier_products", []):
+        bullets.append(f"Add supplier product {sp.get('product')} at {sp.get('supplier')} (Available={sp.get('fields',{}).get('Available')})")
+    for tl in adds.get("transport_lanes", []):
+        bullets.append(f"Add lane {tl.get('mode')} {tl.get('from_location')}→{tl.get('to_location')} ({tl.get('product')})")
+
+    # Deletes
+    dels = s.get("deletes", {})
+    for c in dels.get("customers", []):
+        bullets.append(f"Delete customer {c.get('customer')}")
+    for d in dels.get("customer_product_rows", []):
+        bullets.append(f"Delete demand row {d.get('product')} at {d.get('customer')} (period {d.get('period')})")
+    for w in dels.get("warehouses", []):
+        bullets.append(f"Delete warehouse {w.get('warehouse')}")
+    for sp in dels.get("supplier_products", []):
+        bullets.append(f"Delete supplier product {sp.get('product')} at {sp.get('supplier')}")
+    for tl in dels.get("transport_lanes", []):
+        bullets.append(f"Delete lane {tl.get('mode')} {tl.get('from_location')}→{tl.get('to_location')} ({tl.get('product')})")
+
     return bullets or ["No actionable changes detected."]
 
 def parse_with_llm(prompt: str, dfs, default_period: int = DEFAULT_PERIOD, provider: Optional[str] = None) -> Dict[str, Any]:
@@ -171,12 +238,15 @@ def parse_with_llm(prompt: str, dfs, default_period: int = DEFAULT_PERIOD, provi
     system = (
         "Convert the user's supply-chain what-if into a strict JSON that updates Excel sheets. "
         "Return ONLY JSON matching the given schema. Use EXACT entity names from the allowed lists. "
-        f"Default period is {default_period} unless the user specifies another year."
+        f"Default period is {default_period} unless the user specifies another year. "
+        "You may also add or delete rows (CRUD) using the 'adds' and 'deletes' sections."
     )
     schema = scenario_schema_json()
     guide = {"allowed_entities": catalog, "default_period": default_period, "rules": [
         "Do not invent entities not in allowed_entities.",
         "Prefer existing fields: Demand, Lead Time, Maximum Capacity, Force Open/Close, Available, Cost Per UOM.",
+        "Use 'adds' to create rows (customers, warehouses, supplier products, lanes, CPD).",
+        "Use 'deletes' to remove rows.",
         "If a year is missing, use default period.",
     ]}
     instruction = "Instruction:\n" + prompt + "\n\nConstraints:\n" + json.dumps(guide)
@@ -185,11 +255,11 @@ def parse_with_llm(prompt: str, dfs, default_period: int = DEFAULT_PERIOD, provi
         return _default_scenario(default_period)
     # Ensure required keys
     data.setdefault("period", default_period)
-    for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
-        data.setdefault(k, [])
+    for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates","adds","deletes"]:
+        data.setdefault(k, [] if k not in {"adds","deletes"} else {"customers":[], "customer_demands":[], "warehouses":[], "supplier_products":[], "transport_lanes":[]})
     return data
 
-# ---------- Example generation JSON ----------
+# Example generation APIs unchanged (omitted for brevity here, present in your repo in engine/example_gen.py which imports them)
 def example_schema() -> Dict[str, Any]:
     return {
         "type": "object",
@@ -219,23 +289,22 @@ def generate_examples_with_llm(catalog: Dict[str, List[str]], stats: Dict[str, A
             "1 warehouse capacity or force toggle",
             "1 supplier enable/disable",
             "1 transport lane cost (Mode, From, To, Product)",
+            "1 add-customer with demand",
+            "1 add-warehouse with capacity",
+            "1 delete transport lane"
         ],
         "style": ["short, direct", "no extra commentary", "ASCII arrow '->' is fine"],
         "defaults": {"period": DEFAULT_PERIOD},
         "tips": ["Do not invent entities", "Respect exact spellings/case/underscores"],
     }
     instruction = "Produce 4-8 example prompts.\nContext:\n" + json.dumps(guidance)
-    schema = example_schema()
-    data = llm_json(instruction, schema, system=system, provider=provider)
+    data = llm_json(instruction, example_schema(), system=system, provider=provider)
     if not isinstance(data, dict):
         return []
     ex = data.get("examples") or []
-    # Basic dedupe/strip
-    seen = set()
-    out = []
+    seen = set(); out = []
     for e in ex:
         e = str(e).strip()
         if e and e not in seen:
-            seen.add(e)
-            out.append(e)
+            seen.add(e); out.append(e)
     return out[:8]
