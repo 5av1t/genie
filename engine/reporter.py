@@ -1,7 +1,7 @@
 from typing import Dict, Any, List
 
-def _bulletize(changes: List[str]) -> str:
-    return "\n".join([f"- {x}" for x in changes]) if changes else "- No actionable changes detected."
+def _bulletize(items: List[str]) -> str:
+    return "\n".join([f"- {x}" for x in items]) if items else "-"
 
 def build_summary(prompt: str, scenario: Dict[str, Any], kpis: Dict[str, Any], diag: Dict[str, Any]) -> str:
     period = scenario.get("period", 2023)
@@ -13,7 +13,6 @@ def build_summary(prompt: str, scenario: Dict[str, Any], kpis: Dict[str, Any], d
     open_wh = kpis.get("open_warehouses", 0)
     bindings = diag.get("binding_warehouses", [])
 
-    # Human intent summary
     changes = []
     for d in scenario.get("demand_updates", []):
         msg = f"Demand: {d.get('product')} at {d.get('location')} Δ {d.get('delta_pct', 0)}%"
