@@ -22,6 +22,7 @@ except Exception:
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
 # ========= Read secrets → env for providers (optional convenience) =========
+# NOTE: we never display any secret in the UI.
 if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 if "gcp" in st.secrets and "gemini_api_key" in st.secrets["gcp"]:
@@ -109,36 +110,11 @@ with st.sidebar:
     )
     show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug tabs)", value=False)
     st.markdown("---")
-    st.caption("Tip: Set Gemini key in **.streamlit/secrets.toml** as:\n\n"
-               "```toml\n[gcp]\n gemini_api_key = \"YOUR_KEY\"\n```\n"
-               "Or set `GEMINI_API_KEY` env var. The app auto-detects.")
+    st.caption("Secrets are configured in Streamlit Cloud → App settings → Secrets.\n"
+               "For local dev, create `.streamlit/secrets.toml`. No secrets are shown in this UI.")
 
-# ========= Static examples (pre-upload fallback) =========
-STATIC_EXAMPLES = [
-    "run the base model",
-    "Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8",
-    "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
-    "Enable Thin-Film at Antalya_FG",
-    "Set Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline to cost per uom = 9.5",
-    # CRUD samples
-    "Add customer Muscat; demand 8000 of Mono-Crystalline; lead time 9",
-    "Add warehouse Prague_CDC at Prague; Maximum Capacity 30000; force open",
-    "Delete Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline in 2023",
-]
-
-with st.expander("💡 Prompt examples (static)"):
-    for ex in STATIC_EXAMPLES:
-        st.code(ex, language="text")
-    chosen = st.selectbox("Insert example:", ["(choose one)"] + STATIC_EXAMPLES, key="static_select")
-    if st.button("Insert (static)"):
-        if chosen != "(choose one)":
-            st.session_state["user_prompt"] = chosen
-            st.success("Inserted into the prompt box.")
-
-# ========= Inputs =========
+# ========= Inputs (upload first) =========
 uploaded_file = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
-user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt")
-process_btn = st.button("🚀 Process Scenario")
 
 # ========= Helpers: Delta Views & Auto-connect =========
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, key_cols: list) -> pd.DataFrame:
@@ -257,7 +233,25 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     dfs["Transport Cost"] = tc
     return dfs, len(new_rows)
 
-# ========= Main flow =========
+# ========= Shared examples (static) =========
+STATIC_EXAMPLES = [
+    "run the base model",
+    "Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8",
+    "Cap Bucharest_CDC Maximum Capacity at 25000; force close Berlin_LDC",
+    "Enable Thin-Film at Antalya_FG",
+    "Set Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline to cost per uom = 9.5",
+    # CRUD samples
+    "Add customer Muscat; demand 8000 of Mono-Crystalline; lead time 9",
+    "Add warehouse Prague_CDC at Prague; Maximum Capacity 30000; force open",
+    "Delete Secondary Delivery LTL lane Paris_CDC -> Aalborg for Poly-Crystalline in 2023",
+]
+
+# We build the prompt widget later but need a prefill buffer to safely inject examples.
+user_prompt_value = st.session_state.get("user_prompt", "")
+if "prefill_prompt" in st.session_state:
+    user_prompt_value = st.session_state.pop("prefill_prompt", user_prompt_value)
+
+# ========= Uploaded flow =========
 if uploaded_file:
     # ---- Load & validate ----
     try:
@@ -288,8 +282,10 @@ if uploaded_file:
 
     st.success("Base case loaded successfully.")
 
-    # ---- Dynamic GenAI examples from file ----
-    st.subheader("💡 Prompt examples (from your file)")
+    # ---- Suggested prompts (static + dynamic) ABOVE the prompt box ----
+    st.subheader("💡 Suggested prompts")
+    dyn_examples = []
+    # Compute a fingerprint so we can cache examples per file structure
     try:
         fp_hasher = hashlib.sha1()
         fp_hasher.update("|".join(sorted([f"{k}:{v.shape[0]}x{v.shape[1]}" for k, v in dataframes.items() if isinstance(v, pd.DataFrame)])).encode())
@@ -299,7 +295,6 @@ if uploaded_file:
 
     if "examples_cache" not in st.session_state:
         st.session_state["examples_cache"] = {}
-
     dyn_examples = st.session_state["examples_cache"].get(fingerprint, None)
     if dyn_examples is None:
         dyn_examples = []
@@ -311,16 +306,31 @@ if uploaded_file:
             dyn_examples = []
         st.session_state["examples_cache"][fingerprint] = dyn_examples
 
-    if dyn_examples:
-        for ex in dyn_examples:
-            st.code(ex, language="text")
-        chosen2 = st.selectbox("Insert example:", ["(choose one)"] + dyn_examples, key="dyn_select")
-        if st.button("Insert (from file)"):
-            if chosen2 != "(choose one)":
-                st.session_state["user_prompt"] = chosen2
-                st.success("Inserted into the prompt box.")
-    else:
-        st.info("Could not generate dynamic examples (using static examples above).")
+    with st.expander("Show suggestions"):
+        colA, colB = st.columns(2)
+        # Static
+        with colA:
+            st.markdown("**Static**")
+            for ex in STATIC_EXAMPLES:
+                st.code(ex, language="text")
+            chosen_static = st.selectbox("Insert static example:", ["(choose one)"] + STATIC_EXAMPLES, key="static_select")
+            if st.button("Insert static"):
+                if chosen_static != "(choose one)":
+                    st.session_state["prefill_prompt"] = chosen_static
+                    st.rerun()
+        # Dynamic (GenAI-generated)
+        with colB:
+            st.markdown("**From your file**")
+            if dyn_examples:
+                for ex in dyn_examples:
+                    st.code(ex, language="text")
+                chosen_dyn = st.selectbox("Insert generated example:", ["(choose one)"] + dyn_examples, key="dyn_select")
+                if st.button("Insert generated"):
+                    if chosen_dyn != "(choose one)":
+                        st.session_state["prefill_prompt"] = chosen_dyn
+                        st.rerun()
+            else:
+                st.info("No generated prompts available right now (fallback to static).")
 
     # ---- Map (nodes only, right after upload) ----
     st.subheader("🌍 Network Map (Nodes)")
@@ -365,8 +375,13 @@ if uploaded_file:
     else:
         st.info("pydeck not available or geo module missing; skipping map.")
 
+    st.markdown("---")
+    # ---- Prompt input (render AFTER suggestions to allow safe prefill injection) ----
+    user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt", value=user_prompt_value)
+    process_btn = st.button("🚀 Process Scenario")
+
     # ---- Optional: LLM vs Rules debug tabs ----
-    if show_llm_vs_rules and (st.session_state.get("user_prompt") or "").strip():
+    if show_llm_vs_rules and (user_prompt or "").strip():
         tabs = st.tabs(["LLM Parser", "Rules Parser", "Diff"])
         llm_scenario = None
         rules_scenario = None
@@ -376,7 +391,7 @@ if uploaded_file:
             else:
                 prov = "gemini" if provider.startswith("Google") else "openai"
                 try:
-                    llm_scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
+                    llm_scenario = parse_with_llm(user_prompt, dataframes, default_period=2023, provider=prov)
                 except Exception as e:
                     llm_scenario = {}
                     st.error(f"LLM parse error: {e}")
@@ -391,7 +406,7 @@ if uploaded_file:
                 st.error("Rules parser not available.")
             else:
                 try:
-                    rules_scenario = parse_rules(st.session_state["user_prompt"], dataframes, default_period=2023)
+                    rules_scenario = parse_rules(user_prompt, dataframes, default_period=2023)
                 except Exception as e:
                     rules_scenario = {}
                     st.error(f"Rules parse error: {e}")
@@ -413,15 +428,15 @@ if uploaded_file:
                 st.info(f"Diff unavailable: {e}")
 
     # ---- Main Process flow ----
-    if process_btn and (st.session_state.get("user_prompt") or "").strip():
+    if process_btn and (user_prompt or "").strip():
         # 1) Parse NL → Scenario JSON (LLM or rules)
         try:
             if use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
                 prov = "gemini" if provider.startswith("Google") else "openai"
-                scenario = parse_with_llm(st.session_state["user_prompt"], dataframes, default_period=2023, provider=prov)
+                scenario = parse_with_llm(user_prompt, dataframes, default_period=2023, provider=prov)
                 parsed_by = provider
             else:
-                scenario = parse_rules(st.session_state["user_prompt"], dataframes, default_period=2023) if parse_rules else {}
+                scenario = parse_rules(user_prompt, dataframes, default_period=2023) if parse_rules else {}
                 parsed_by = "rules"
         except Exception as e:
             st.error(f"❌ Parsing failed: {e}")
@@ -435,7 +450,7 @@ if uploaded_file:
             st.json(scenario)
 
         # Special: "run base model" → don't apply changes
-        run_base = str(st.session_state["user_prompt"]).strip().lower() in {"run the base model", "run base model"}
+        run_base = str(user_prompt).strip().lower() in {"run the base model", "run base model"}
 
         # Deletion safety
         pending_deletes = 0
@@ -471,30 +486,6 @@ if uploaded_file:
         after_tc  = updated.get("Transport Cost", pd.DataFrame()).copy()
         after_cu  = updated.get("Customers", pd.DataFrame()).copy()
 
-        # 2.5) Quick preview
-        st.subheader("📋 Before vs After (Quick Preview)")
-        tabs = st.tabs(["Customers", "Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
-        with tabs[0]:
-            colA, colB = st.columns(2)
-            with colA: st.markdown("**Before**"); st.dataframe(before_cu.head(25), use_container_width=True)
-            with colB: st.markdown("**After**");  st.dataframe(after_cu.head(25), use_container_width=True)
-        with tabs[1]:
-            colA, colB = st.columns(2)
-            with colA: st.markdown("**Before**"); st.dataframe(before_cpd.head(25), use_container_width=True)
-            with colB: st.markdown("**After**");  st.dataframe(after_cpd.head(25), use_container_width=True)
-        with tabs[2]:
-            colA, colB = st.columns(2)
-            with colA: st.markdown("**Before**"); st.dataframe(before_wh.head(25), use_container_width=True)
-            with colB: st.markdown("**After**");  st.dataframe(after_wh.head(25), use_container_width=True)
-        with tabs[3]:
-            colA, colB = st.columns(2)
-            with colA: st.markdown("**Before**"); st.dataframe(before_sp.head(25), use_container_width=True)
-            with colB: st.markdown("**After**");  st.dataframe(after_sp.head(25), use_container_width=True)
-        with tabs[4]:
-            colA, colB = st.columns(2)
-            with colA: st.markdown("**Before**"); st.dataframe(before_tc.head(25), use_container_width=True)
-            with colB: st.markdown("**After**");  st.dataframe(after_tc.head(25), use_container_width=True)
-
         # 2.6) Auto-connect (demo feasibility)
         auto = st.checkbox(
             "🔗 Auto-create missing lanes for feasibility (demo)",
@@ -519,7 +510,7 @@ if uploaded_file:
         with col2:
             st.subheader("📝 Executive Summary")
             if build_summary:
-                st.markdown(build_summary(st.session_state["user_prompt"], scenario, kpis, diag))
+                st.markdown(build_summary(user_prompt, scenario, kpis, diag))
             else:
                 st.info("reporter.build_summary missing.")
 
@@ -589,7 +580,30 @@ if uploaded_file:
         else:
             st.info("pydeck not available or geo module missing; skipping map.")
 
-        # 5) Delta Views
+        # 5) Quick preview & Delta Views
+        st.subheader("📋 Before vs After (Quick Preview)")
+        tabs = st.tabs(["Customers", "Customer Product Data", "Warehouse", "Supplier Product", "Transport Cost"])
+        with tabs[0]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_cu.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_cu.head(25), use_container_width=True)
+        with tabs[1]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_cpd.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_cpd.head(25), use_container_width=True)
+        with tabs[2]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_wh.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_wh.head(25), use_container_width=True)
+        with tabs[3]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_sp.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_sp.head(25), use_container_width=True)
+        with tabs[4]:
+            colA, colB = st.columns(2)
+            with colA: st.markdown("**Before**"); st.dataframe(before_tc.head(25), use_container_width=True)
+            with colB: st.markdown("**After**");  st.dataframe(after_tc.head(25), use_container_width=True)
+
         st.subheader("Δ Delta Views (Changes Only)")
         show_delta_block("Customers", before_cu, after_cu, ["Customer", "Location"])
         show_delta_block("Customer Product Data", before_cpd, after_cpd, ["Product", "Customer", "Location", "Period"])
@@ -619,8 +633,8 @@ if uploaded_file:
         except Exception as e:
             st.warning(f"Creating the Excel download failed: {e}")
 
+# ========= No-file flow =========
 else:
-    # No file yet → provide sample download
     st.info("Upload your base case to begin. Or download a sample template:")
     raw_url = "https://raw.githubusercontent.com/5av1t/genie/main/sample_base_case.xlsx"
     if os.path.exists("sample_base_case.xlsx"):
@@ -634,3 +648,24 @@ else:
     else:
         st.markdown(f"[⬇️ Download Sample Base Case Template]({raw_url})")
         st.caption("Tip: Add `sample_base_case.xlsx` to the repo root to show a direct in‑app download button.")
+
+    # Suggested prompts ABOVE the prompt box
+    st.subheader("💡 Suggested prompts")
+    with st.expander("Show suggestions"):
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("**Static**")
+            for ex in STATIC_EXAMPLES:
+                st.code(ex, language="text")
+            chosen_static = st.selectbox("Insert static example:", ["(choose one)"] + STATIC_EXAMPLES, key="static_select_no_file")
+            if st.button("Insert static", key="insert_static_no_file"):
+                if chosen_static != "(choose one)":
+                    st.session_state["prefill_prompt"] = chosen_static
+                    st.rerun()
+        with colB:
+            st.markdown("**From your file**")
+            st.info("Upload a file to generate tailored prompts here.")
+
+    # Prompt input (render AFTER suggestions to allow safe prefill injection)
+    user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt", value=user_prompt_value)
+    st.caption("Upload a file to process scenarios.")
