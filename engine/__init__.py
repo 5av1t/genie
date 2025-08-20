@@ -1,11 +1,10 @@
-# Make engine a package
 __all__ = [
     "loader",
     "parser",
     "genai",
+    "example_gen",
     "updater",
     "optimizer",
     "reporter",
     "geo",
 ]
-# makes `engine` a package
