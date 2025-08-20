@@ -1,4 +1,5 @@
-# --- GENIE: Streamlit App (Grounded Q&A + Gemini/OpenAI optional, Rules parser, CRUD, Auto-Connect, Maps, Optimizer) ---
+# --- GENIE: Supply Chain Network Designer ---
+# Upload Excel → (Prompt OR Manual CRUD) → Apply → Optimize → KPIs + Maps → Q&A → Export
 
 import os
 from io import BytesIO
@@ -9,7 +10,7 @@ import pandas as pd
 try:
     import streamlit as st
 except ModuleNotFoundError:
-    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt.")
+    print("This application requires Streamlit to run. Please add `streamlit` to requirements.txt and deploy again.")
     raise
 
 try:
@@ -19,17 +20,16 @@ except Exception:
 
 st.set_page_config(page_title="GENIE - Supply Chain Network Designer", layout="wide")
 
-# Load secrets to env (never display)
-for block in ("openai","gcp","gemini"):
+# --- Load secrets (never display) ---
+for block in ("openai", "gcp", "gemini"):
     if block in st.secrets:
         for k, v in st.secrets[block].items():
             if isinstance(v, str):
                 os.environ[f"{block.upper()}_{k.upper()}"] = v
-# also map common names
 if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
     os.environ["GEMINI_API_KEY"] = st.secrets["gemini"]["api_key"]
 
-# --- Engine imports
+# --- Import engine modules ---
 missing = []
 try:
     from engine.loader import load_and_validate_excel as loader
@@ -76,11 +76,10 @@ if missing:
     st.error("❌ Missing engine modules:\n- " + "\n- ".join(missing))
     st.stop()
 
-# --- Header
+# --- Header / Sidebar ---
 st.title("🔮 GENIE — Generative Engine for Network Intelligence & Execution")
-st.caption("Upload a base case → describe a scenario → GENIE updates sheets, optimizes, and maps your network.")
+st.caption("Upload a base case → describe a scenario or use Manual Edits → GENIE updates sheets, optimizes, and maps your network.")
 
-# --- Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
     provider = st.selectbox(
@@ -89,10 +88,9 @@ with st.sidebar:
         index=0
     )
     use_llm_parser = st.checkbox("Use GenAI parser for scenarios", value=(provider != "Rules only (no LLM)"))
-    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug tabs)", value=False)
+    show_llm_vs_rules = st.checkbox("Show LLM vs Rules (debug)", value=False)
     st.markdown("---")
-    st.subheader("🧠 What can GENIE do?")
-    st.caption("Everything is entity-checked against your uploaded file.")
+    st.subheader("🧠 GENIE can:")
     st.markdown(
         "- Adjust **Demand** / **Lead Time** per Customer & Product\n"
         "- Change **Warehouse** capacity/costs; Force Open/Close\n"
@@ -103,12 +101,12 @@ with st.sidebar:
         "- **Ask about results** (lowest throughput, top lanes, bottlenecks)"
     )
     st.markdown("---")
-    st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local: `.streamlit/secrets.toml`.")
+    st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local: `.streamlit/secrets.toml` (add gemini/api_key or openai/api_key).")
 
-# --- Upload
+# --- Upload ---
 uploaded = st.file_uploader("📤 Upload base case Excel (.xlsx)", type=["xlsx"])
 
-# --- Delta helpers
+# --- Utils for delta views ---
 def build_delta_view(before: pd.DataFrame, after: pd.DataFrame, keys: list) -> pd.DataFrame:
     if after is None or not isinstance(after, pd.DataFrame) or after.empty:
         return pd.DataFrame(columns=keys + ["Field","Before","After","ChangeType"])
@@ -159,7 +157,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     need = set()
     if isinstance(cpd, pd.DataFrame) and not cpd.empty:
         use = cpd.copy()
-        if "Period" in use.columns: use = use[use["Period"] == period]
+        if "Period" in use.columns: use = use[use["Period"] == 2023]
         for _, r in use.iterrows():
             cust = str(r.get("Customer")); prod = str(r.get("Product"))
             try: dem = float(r.get("Demand", 0) or 0)
@@ -169,7 +167,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     if isinstance(tc, pd.DataFrame) and not tc.empty:
         for _, r in tc.iterrows():
             try:
-                if int(r.get("Period", period)) != period: continue
+                if int(r.get("Period", 2023)) != 2023: continue
             except Exception: continue
             existing.add((str(r.get("From Location")), str(r.get("To Location")), str(r.get("Product"))))
     new_rows = []
@@ -178,7 +176,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
             key = (str(from_loc), str(to_cust), str(prod))
             if key in existing: continue
             new_rows.append({
-                "Mode of Transport":"Secondary Delivery LTL","Product":prod,"From Location":from_loc,"To Location":to_cust,"Period":period,
+                "Mode of Transport":"Secondary Delivery LTL","Product":prod,"From Location":from_loc,"To Location":to_cust,"Period":2023,
                 "UOM":"Each","Available":1,"Retrieve Distance":0.0,"Average Load Size":1.0,"Cost Per UOM":float(default_cost),
                 "Cost per Distance":0.0,"Cost per Trip":0.0,"Minimum Cost Per Trip":0.0
             })
@@ -187,7 +185,7 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
     dfs["Transport Cost"] = tc
     return dfs, len(new_rows)
 
-# Static seed examples (generic, no product names)
+# Static examples for when we can't read from file yet
 STATIC_EXAMPLES = [
     "run the base model",
     "Increase demand at a specific customer by 10% and set lead time to 8",
@@ -203,9 +201,9 @@ user_prompt_default = st.session_state.get("user_prompt","")
 if "prefill_prompt" in st.session_state:
     user_prompt_default = st.session_state.pop("prefill_prompt", user_prompt_default)
 
-# --- Main flow
+# ------------------ MAIN ------------------
 if uploaded:
-    # Load & validate
+    # Load + validate
     try:
         dfs, report = loader(uploaded)
     except Exception as e:
@@ -216,11 +214,9 @@ if uploaded:
             for sheet, rep in report.items():
                 if sheet == "_warnings": continue
                 if not isinstance(rep, dict): continue
-                missing_cols = rep.get("missing_columns", [])
-                if missing_cols:
-                    st.error(f"{sheet}: Missing columns - {missing_cols}")
-                else:
-                    st.success(f"{sheet}: OK ({rep.get('num_rows',0)} rows, {rep.get('num_columns',0)} columns)")
+                miss = rep.get("missing_columns", [])
+                if miss: st.error(f"{sheet}: Missing columns - {miss}")
+                else:    st.success(f"{sheet}: OK ({rep.get('num_rows',0)} rows, {rep.get('num_columns',0)} columns)")
             if isinstance(report.get("_warnings", []), list) and report["_warnings"]:
                 st.warning("General warnings:")
                 for w in report["_warnings"]: st.write(f"• {w}")
@@ -229,7 +225,7 @@ if uploaded:
 
     st.success("Base case loaded successfully.")
 
-    # Suggested prompts (dynamic from file + static) ABOVE prompt box
+    # Suggested prompts ABOVE the prompt box
     st.subheader("💡 Suggested prompts")
     try:
         fp = hashlib.sha1("|".join(sorted([f"{k}:{v.shape[0]}x{v.shape[1]}" for k, v in dfs.items() if isinstance(v, pd.DataFrame)])).encode()).hexdigest()
@@ -266,10 +262,6 @@ if uploaded:
 
     # Map of nodes (on upload)
     st.subheader("🌍 Network Map (Nodes)")
-    try:
-        from engine.geo import build_nodes, guess_map_center, flows_to_geo  # reimport in case hot-reload
-    except Exception:
-        build_nodes = guess_map_center = flows_to_geo = None
     if pdk and build_nodes and guess_map_center:
         try:
             nodes = build_nodes(dfs)
@@ -291,11 +283,148 @@ if uploaded:
         st.info("pydeck not available or geo module missing; skipping map.")
 
     st.markdown("---")
-    # Prompt input
-    user_prompt = st.text_area("🧠 Describe your what‑if scenario", height=120, key="user_prompt", value=user_prompt_default)
+
+    # ---------------- Manual Edits (CRUD) ----------------
+    st.subheader("🛠️ Manual Edits (point‑and‑click)")
+    with st.expander("Open Manual Edits"):
+        # Pull values for selects
+        products  = sorted(dfs.get("Customer Product Data", pd.DataFrame()).get("Product", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+        customers = sorted(dfs.get("Customers", pd.DataFrame()).get("Customer", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+        locations_c = sorted(dfs.get("Customers", pd.DataFrame()).get("Location", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+        warehouses = sorted(dfs.get("Warehouse", pd.DataFrame()).get("Warehouse", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+        locations_w = sorted(dfs.get("Warehouse", pd.DataFrame()).get("Location", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+        modes      = sorted(dfs.get("Transport Cost", pd.DataFrame()).get("Mode of Transport", pd.Series([], dtype=object)).dropna().astype(str).unique().tolist())
+
+        tabs_crud = st.tabs(["Demand update","Add customer","Add/Update warehouse","Add/Update lane","Delete"])
+
+        # Demand update
+        with tabs_crud[0]:
+            st.caption("Update demand for a given Product × Customer × (Location=Customer by default)")
+            p = st.selectbox("Product", products, key="crud_dem_p") if products else st.text_input("Product (type exact)", key="crud_dem_p_txt")
+            c = st.selectbox("Customer", customers, key="crud_dem_c") if customers else st.text_input("Customer (type exact)", key="crud_dem_c_txt")
+            loc = st.text_input("Location (defaults to Customer)", value="", key="crud_dem_loc")
+            col1, col2 = st.columns(2)
+            with col1:
+                delta = st.number_input("Δ% (apply percent change, optional)", value=0.0, step=1.0, format="%.2f")
+            with col2:
+                set_abs = st.number_input("Set absolute Demand (overrides Δ%, optional)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            lt = st.number_input("Set Lead Time (optional)", min_value=0, value=0, step=1)
+            if st.button("➕ Queue demand update"):
+                loc_final = loc.strip() or (c if isinstance(c, str) else "")
+                ed = {"product": str(p), "customer": str(c), "location": str(loc_final)}
+                if set_abs > 0:
+                    ed["set"] = {"Demand": float(set_abs)}
+                elif abs(delta) > 0:
+                    ed["delta_pct"] = float(delta)
+                if lt > 0:
+                    ed.setdefault("set", {})["Lead Time"] = int(lt)
+                st.session_state.setdefault("manual_scenario", {"period": 2023})
+                st.session_state["manual_scenario"].setdefault("demand_updates", []).append(ed)
+                st.success(f"Queued: {ed}")
+
+        # Add customer
+        with tabs_crud[1]:
+            st.caption("Create customer and (optionally) its demand row.")
+            nc = st.text_input("New Customer name", key="crud_addcust_name")
+            nloc = st.text_input("Location (defaults to same name)", key="crud_addcust_loc")
+            ap = st.selectbox("Product for initial demand (optional)", ["(none)"] + products, key="crud_addcust_prod")
+            ad = st.number_input("Initial Demand (optional)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            alt = st.number_input("Lead Time (optional)", min_value=0, value=0, step=1)
+            if st.button("➕ Queue customer add"):
+                loc_final = nloc.strip() or nc.strip()
+                scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
+                scn.setdefault("adds", {}).setdefault("Customers", []).append({"Customer": nc.strip(), "Location": loc_final})
+                if ap != "(none)" and ad > 0:
+                    scn.setdefault("adds", {}).setdefault("Customer Product Data", []).append({
+                        "Product": ap, "Customer": nc.strip(), "Location": loc_final, "Period": 2023, "UOM": "Each",
+                        "Demand": float(ad), "Lead Time": int(alt) if alt>0 else None
+                    })
+                st.success(f"Queued: Customer {nc} (Location {loc_final})")
+
+        # Add/Update warehouse
+        with tabs_crud[2]:
+            st.caption("Create or modify a warehouse row.")
+            mode_w = st.radio("Action", ["Add new","Update existing"], horizontal=True, key="crud_wh_mode")
+            if mode_w == "Add new":
+                nw = st.text_input("Warehouse name", key="crud_wh_new")
+                nlocw = st.text_input("Location", key="crud_wh_new_loc")
+                cap = st.number_input("Maximum Capacity", min_value=0.0, value=0.0, step=100.0)
+                f_open = st.checkbox("Force Open", value=True)
+                if st.button("➕ Queue warehouse add"):
+                    scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
+                    scn.setdefault("adds", {}).setdefault("Warehouse", []).append({
+                        "Warehouse": nw.strip(), "Location": nlocw.strip() or nw.strip(), "Maximum Capacity": float(cap),
+                        "Force Open": 1 if f_open else 0
+                    })
+                    st.success(f"Queued: Warehouse {nw}")
+            else:
+                uw = st.selectbox("Warehouse", warehouses, key="crud_wh_upd")
+                field = st.selectbox("Field", ["Maximum Capacity","Fixed Cost","Variable Cost","Force Open","Force Close"], key="crud_wh_field")
+                newv = st.text_input("New value (number or 0/1 for Force)", key="crud_wh_val")
+                if st.button("➕ Queue warehouse update"):
+                    v = float(newv) if field in {"Maximum Capacity","Fixed Cost","Variable Cost"} else int(float(newv))
+                    scn = st.session_state.setdefault("manual_scenario", {"period": 2023})
+                    scn.setdefault("warehouse_changes", []).append({"warehouse": uw, "field": field, "new_value": v})
+                    st.success(f"Queued: {uw} {field} -> {v}")
+
+        # Add/Update lane
+        with tabs_crud[3]:
+            st.caption("Create or modify a Transport Cost lane.")
+            m = st.selectbox("Mode of Transport", modes if modes else ["Secondary Delivery LTL"], key="crud_tc_mode")
+            fp = st.selectbox("Product (blank applies to all demand for To)", ["(blank)"] + products, key="crud_tc_prod")
+            fr = st.selectbox("From (use warehouse name or its Location)", warehouses + locations_w, key="crud_tc_from")
+            to = st.selectbox("To (use Customer name or Customers.Location)", customers + locations_c, key="crud_tc_to")
+            cpu = st.number_input("Cost Per UOM (leave 0 to compute via distance*cost_per_distance if your file uses those)", min_value=0.0, value=10.0, step=0.5)
+            avail = st.selectbox("Available", [1,0], index=0)
+            if st.button("➕ Queue lane upsert"):
+                prod_val = "" if fp == "(blank)" else fp
+                st.session_state.setdefault("manual_scenario", {"period": 2023})
+                st.session_state["manual_scenario"].setdefault("transport_updates", []).append({
+                    "mode": m, "product": prod_val, "from_location": fr, "to_location": to, "period": 2023,
+                    "fields": {"Cost Per UOM": float(cpu), "Available": int(avail)}
+                })
+                st.success(f"Queued: {m} {fr} -> {to} ({prod_val or 'ALL'})")
+
+        # Delete
+        with tabs_crud[4]:
+            st.caption("Careful: deletions require explicit checkbox during Process.")
+            del_kind = st.selectbox("What to delete?", ["Transport lane","Customer","Warehouse"], key="crud_del_kind")
+            if del_kind == "Transport lane":
+                m = st.selectbox("Mode", modes if modes else ["Secondary Delivery LTL"], key="crud_del_mode")
+                fr = st.text_input("From Location (warehouse or its location)", key="crud_del_from")
+                to = st.text_input("To Location (customer or its location)", key="crud_del_to")
+                prod = st.text_input("Product (exact; leave blank to match all rows)", key="crud_del_prod")
+                if st.button("➕ Queue delete"):
+                    st.session_state.setdefault("manual_scenario", {"period": 2023})
+                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Transport Cost", []).append({
+                        "Mode of Transport": m, "From Location": fr.strip(), "To Location": to.strip(), "Product": prod.strip(), "Period": 2023
+                    })
+                    st.success("Queued: delete lane")
+            elif del_kind == "Customer":
+                c = st.selectbox("Customer", customers, key="crud_del_cust")
+                if st.button("➕ Queue delete customer"):
+                    st.session_state.setdefault("manual_scenario", {"period": 2023})
+                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Customers", []).append({"Customer": c})
+                    st.success(f"Queued: delete customer {c}")
+            else:
+                w = st.selectbox("Warehouse", warehouses, key="crud_del_wh")
+                if st.button("➕ Queue delete warehouse"):
+                    st.session_state.setdefault("manual_scenario", {"period": 2023})
+                    st.session_state["manual_scenario"].setdefault("deletes", {}).setdefault("Warehouse", []).append({"Warehouse": w})
+                    st.success(f"Queued: delete warehouse {w}")
+
+        # View queued manual scenario JSON
+        queued = st.session_state.get("manual_scenario")
+        if queued:
+            st.markdown("**Queued Manual Scenario (will be merged with Prompt scenario)**")
+            st.json(queued)
+
+    # ---------------- Natural-language Prompt ----------------
+    st.subheader("🧠 Describe your what‑if scenario")
+    user_prompt = st.text_area("Prompt (or type 'run the base model')", height=120, key="user_prompt", value=user_prompt_default)
     go = st.button("🚀 Process Scenario")
 
-    # Optional: LLM vs Rules display
+    # Optional LLM vs Rules comparison
     if show_llm_vs_rules and (user_prompt or "").strip():
         tabs = st.tabs(["LLM Parser","Rules Parser","Diff"])
         llm_scn = rules_scn = None
@@ -326,46 +455,63 @@ if uploaded:
             except Exception as e:
                 st.info(f"Diff unavailable: {e}")
 
-    # Process scenario
+    # ---------------- Process scenario (Prompt + Manual) ----------------
     if go and (user_prompt or "").strip():
-        # Parse
+        # 1) Parse prompt
         try:
-            if use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
+            if user_prompt.strip().lower() in {"run the base model","run base model"}:
+                prompt_scn = {"period": 2023}
+                parsed_by = "base"
+            elif use_llm_parser and parse_with_llm is not None and provider != "Rules only (no LLM)":
                 prov = "gemini" if provider.startswith("Google") else "openai"
-                scenario = parse_with_llm(user_prompt, dfs, default_period=2023, provider=prov)
-                parsed_by = provider
+                prompt_scn = parse_with_llm(user_prompt, dfs, default_period=2023, provider=prov); parsed_by = provider
             else:
-                scenario = parse_rules(user_prompt, dfs, default_period=2023) if parse_rules else {}
+                prompt_scn = parse_rules(user_prompt, dfs, default_period=2023) if parse_rules else {}
                 parsed_by = "rules"
         except Exception as e:
             st.error(f"❌ Parsing failed: {e}"); st.stop()
 
-        st.subheader(f"Scenario ({parsed_by})")
-        if summarize_scenario: st.markdown("\n".join(f"- {b}" for b in summarize_scenario(scenario)))
-        with st.expander("Advanced: show raw JSON"): st.json(scenario)
+        # 2) Merge Manual Edits (if any)
+        manual = st.session_state.get("manual_scenario", {})
+        scenario = {}
+        # shallow merge period + list fields
+        scenario["period"] = (manual.get("period") or prompt_scn.get("period") or 2023)
+        for key in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
+            scenario[key] = []
+            if isinstance(prompt_scn.get(key), list): scenario[key].extend(prompt_scn[key])
+            if isinstance(manual.get(key), list):     scenario[key].extend(manual[key])
+        for key in ["adds","deletes"]:
+            if prompt_scn.get(key) or manual.get(key):
+                scenario[key] = {}
+                if isinstance(prompt_scn.get(key), dict):
+                    for k,v in prompt_scn[key].items():
+                        scenario[key].setdefault(k, []).extend(v)
+                if isinstance(manual.get(key), dict):
+                    for k,v in manual[key].items():
+                        scenario[key].setdefault(k, []).extend(v)
 
-        run_base = str(user_prompt).strip().lower() in {"run the base model","run base model"}
-        # Deletion safety
+        st.subheader(f"Scenario to apply ({parsed_by} + manual)")
+        if summarize_scenario: st.markdown("\n".join(f"- {b}" for b in summarize_scenario(scenario)))
+        with st.expander("Advanced: raw JSON"): st.json(scenario)
+
+        # 3) Deletion safety
         pending_del = sum(len(v) for v in (scenario.get("deletes") or {}).values()) if isinstance(scenario.get("deletes"), dict) else 0
         allow_delete = True
         if pending_del > 0:
             allow_delete = st.checkbox(f"🛑 Apply deletions ({pending_del} row(s))", value=False)
 
-        # Before copies
+        # 4) Before copies
         b_cpd = dfs.get("Customer Product Data", pd.DataFrame()).copy()
         b_wh  = dfs.get("Warehouse", pd.DataFrame()).copy()
         b_sp  = dfs.get("Supplier Product", pd.DataFrame()).copy()
         b_tc  = dfs.get("Transport Cost", pd.DataFrame()).copy()
         b_cu  = dfs.get("Customers", pd.DataFrame()).copy()
 
-        # Apply
-        if not run_base:
-            try:
-                newdfs = apply_scenario(dfs, scenario, allow_delete=allow_delete)
-            except Exception as e:
-                st.error(f"❌ Applying scenario failed: {e}"); st.stop()
-        else:
-            newdfs = dfs
+        # 5) Apply
+        try:
+            newdfs = apply_scenario(dfs, scenario, allow_delete=allow_delete)
+        except Exception as e:
+            st.error(f"❌ Applying scenario failed: {e}"); st.stop()
 
         a_cpd = newdfs.get("Customer Product Data", pd.DataFrame()).copy()
         a_wh  = newdfs.get("Warehouse", pd.DataFrame()).copy()
@@ -373,16 +519,22 @@ if uploaded:
         a_tc  = newdfs.get("Transport Cost", pd.DataFrame()).copy()
         a_cu  = newdfs.get("Customers", pd.DataFrame()).copy()
 
-        # Auto-connect
+        # 6) Auto-connect missing lanes (optional)
         auto = st.checkbox("🔗 Auto-create missing lanes for feasibility (demo)", value=True)
         if auto:
             newdfs, created = autoconnect_lanes(newdfs, period=scenario.get("period", 2023), default_cost=10.0)
             if created > 0: st.info(f"Auto-connect created {created} placeholder lane(s).")
 
-        # Optimize
+        # 7) Optimize
         if run_optimizer is None: st.error("Optimizer module missing."); st.stop()
         kpis, diag = run_optimizer(newdfs, period=scenario.get("period", 2023))
 
+        # Persist so Q&A won’t reset on rerun
+        st.session_state["last_newdfs"] = newdfs
+        st.session_state["last_kpis"]   = kpis
+        st.session_state["last_diag"]   = diag
+
+        # 8) KPIs & Summary
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("📊 KPIs"); st.write(kpis)
@@ -391,7 +543,7 @@ if uploaded:
             if build_summary: st.markdown(build_summary(user_prompt, scenario, kpis, diag))
             else: st.info("reporter.build_summary missing.")
 
-        # Diagnostics (why no lines)
+        # 9) Flow Diagnostics
         st.subheader("🧪 Flow Diagnostics")
         try:
             period = scenario.get("period", 2023)
@@ -421,50 +573,53 @@ if uploaded:
         except Exception as e:
             st.info(f"Diagnostics unavailable: {e}")
 
-        # Map with flows
+        # 10) Map with flows (ONLY solver flows; proper tooltip)
         st.subheader("🌍 Network Map (With Flows)")
         if pdk and build_nodes and flows_to_geo and guess_map_center:
             try:
-                nodes = build_nodes(newdfs)
-                flows = (diag or {}).get("flows", [])
-                arcs_df = flows_to_geo(flows, newdfs)
-                if nodes.empty:
+                nodes_df = build_nodes(newdfs)
+                flow_list = (diag or {}).get("flows", [])
+                arcs_df = flows_to_geo(flow_list, newdfs)
+
+                if nodes_df.empty:
                     st.info("No geocoded nodes available. Add a 'Locations' sheet with Latitude/Longitude or recognized city names.")
                 else:
-                    lat0, lon0 = guess_map_center(nodes)
-                    wh = nodes[nodes["type"]=="warehouse"]; cu = nodes[nodes["type"]=="customer"]
+                    lat0, lon0 = guess_map_center(nodes_df)
+                    wh = nodes_df[nodes_df["type"]=="warehouse"]; cu = nodes_df[nodes_df["type"]=="customer"]
                     layers=[]
                     if not wh.empty:
                         layers.append(pdk.Layer("ScatterplotLayer", data=wh, get_position='[lon, lat]', get_radius=60000, pickable=True, filled=True, get_fill_color=[30,136,229]))
                     if not cu.empty:
                         layers.append(pdk.Layer("ScatterplotLayer", data=cu, get_position='[lon, lat]', get_radius=40000, pickable=True, filled=True, get_fill_color=[76,175,80]))
                     if isinstance(arcs_df, pd.DataFrame) and not arcs_df.empty:
-                        arcs_df = arcs_df.assign(width=(arcs_df["qty"].clip(lower=1) ** 0.5))
-                        layers.append(pdk.Layer("ArcLayer", data=arcs_df, get_source_position='[from_lon, from_lat]', get_target_position='[to_lon, to_lat]', get_width='width', get_source_color=[255,140,0], get_target_color=[255,64,64], pickable=True))
-                    deck=pdk.Deck(initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2), layers=layers, tooltip={"html":"<b>{name}</b><br/>{location}","style":{"color":"white"}})
+                        arcs_df = arcs_df[arcs_df["qty"] > 1e-9].copy()
+                        if not arcs_df.empty:
+                            arcs_df["width"] = (arcs_df["qty"].clip(lower=1.0)) ** 0.5
+                            layers.append(pdk.Layer(
+                                "ArcLayer",
+                                data=arcs_df,
+                                get_source_position='[from_lon, from_lat]',
+                                get_target_position='[to_lon, to_lat]',
+                                get_width='width',
+                                get_source_color=[255,140,0],
+                                get_target_color=[255,64,64],
+                                pickable=True,
+                            ))
+                    deck=pdk.Deck(
+                        initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=3.2),
+                        layers=layers,
+                        tooltip={"html":"<b>{from}</b> → <b>{to}</b><br/>{product}: {qty}","style":{"color":"white"}}
+                    )
                     st.pydeck_chart(deck)
+
+                    if (diag or {}).get("flows", []) and (arcs_df is None or arcs_df.empty):
+                        st.warning("Flows exist but none were plotted. Ensure warehouse/customer names resolve to coordinates (Locations sheet or known city names).")
             except Exception as e:
                 st.warning(f"Map rendering skipped: {e}")
         else:
             st.info("pydeck not available or geo module missing; skipping map.")
 
-        # Results Q&A — choose mode
-        st.subheader("💬 Ask GENIE about results")
-        qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True)
-        q = st.text_input("e.g., 'Which warehouse has the lowest throughput?' 'Top 3 lanes by flow?'", key="qa_q")
-        if st.button("Ask"):
-            if not q.strip():
-                st.info("Type a question first.")
-            else:
-                if answer_question is None:
-                    st.error("GenAI Q&A not available.")
-                else:
-                    prov = "gemini" if qa_mode.startswith("Gemini") else ("openai" if qa_mode.startswith("OpenAI") else "gemini")
-                    force_llm = not qa_mode.startswith("Grounded")
-                    ans = answer_question(q.strip(), kpis, diag, provider=prov, dfs=newdfs, force_llm=force_llm)
-                    st.markdown(f"**Answer**: {ans}")
-
-        # Before/After + Deltas
+        # 11) Before/After + Δ
         st.subheader("📋 Before vs After (Quick Preview)")
         tabs = st.tabs(["Customers","Customer Product Data","Warehouse","Supplier Product","Transport Cost"])
         with tabs[0]:
@@ -499,7 +654,7 @@ if uploaded:
         if isinstance(a_tc, pd.DataFrame) and not a_tc.empty:
             show_delta("Transport Cost", b_tc, a_tc, ["Mode of Transport","Product","From Location","To Location","Period"])
 
-        # Export
+        # 12) Export
         st.subheader("💾 Export")
         try:
             buf = BytesIO()
@@ -510,6 +665,27 @@ if uploaded:
             st.download_button("Download Updated Scenario Excel", data=buf.getvalue(), file_name="genie_updated_scenario.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
             st.warning(f"Creating the Excel download failed: {e}")
+
+    # ---------------- Ask GENIE (persists across reruns) ----------------
+    st.subheader("💬 Ask GENIE about results")
+    qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
+    with st.form("qa_form", clear_on_submit=False):
+        q = st.text_input("e.g., 'Which warehouse has the lowest throughput?' 'Top 3 lanes by flow?'", key="qa_text")
+        submit_qa = st.form_submit_button("Ask")
+    if submit_qa:
+        last_kpis = st.session_state.get("last_kpis")
+        last_diag = st.session_state.get("last_diag")
+        last_dfs  = st.session_state.get("last_newdfs")
+        if not last_kpis or not last_diag:
+            st.error("No results in memory yet. Run a scenario first.")
+        else:
+            prov = "gemini" if qa_mode.startswith("Gemini") else ("openai" if qa_mode.startswith("OpenAI") else "gemini")
+            force_llm = not qa_mode.startswith("Grounded")
+            if answer_question is None:
+                st.error("GenAI Q&A not available.")
+            else:
+                ans = answer_question(q.strip(), last_kpis, last_diag, provider=prov, dfs=last_dfs, force_llm=force_llm)
+                st.markdown(f"**Answer**: {ans}")
 
 else:
     st.info("Upload your base case to begin. Or download a sample template:")
