@@ -12,13 +12,14 @@ def _vals(df, col) -> List[str]:
 def _catalog(dfs: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
     return {
         "products": _vals(dfs.get("Products"), "Product"),
-        "customers": _vals(dfs.get("Customers"), "Customer"),
+        "customers": _vals(dfs.get("Customers"), "Customer") or _vals(dfs.get("Customer Product Data"), "Customer"),
         "warehouses": _vals(dfs.get("Warehouse"), "Warehouse"),
         "suppliers": _vals(dfs.get("Supplier Product"), "Supplier"),
         "modes": _vals(dfs.get("Mode of Transport"), "Mode of Transport"),
         "locations": sorted(
             set(_vals(dfs.get("Warehouse"), "Location")) |
             set(_vals(dfs.get("Customers"), "Location")) |
+            set(_vals(dfs.get("Customer Product Data"), "Location")) |
             set(_vals(dfs.get("Customers"), "Customer"))
         ),
     }
@@ -27,7 +28,6 @@ def _base_scenario(period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
     return {"period": period, "demand_updates": [], "warehouse_changes": [], "supplier_changes": [], "transport_updates": []}
 
 def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int = DEFAULT_PERIOD) -> Dict[str, Any]:
-    """Lightweight rules parser for validated examples + common edits."""
     if not prompt:
         return _base_scenario(default_period)
     text = prompt.strip()
@@ -47,7 +47,6 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
         s["period"] = int(m_year.group(1))
 
     # Demand increase/decrease by %
-    # e.g., Increase Mono-Crystalline demand at Abu Dhabi by 10% and set lead time to 8
     dm = re.search(r"(increase|decrease)\s+([A-Za-z0-9\-\s]+)\s+demand\s+at\s+([A-Za-z0-9\-\s]+)\s+by\s+(\d+(?:\.\d+)?)\s*%", text, re.I)
     if dm:
         kind, prod, cust, pct = dm.groups()
@@ -56,14 +55,12 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
         if prod in cats["products"] and cust in cats["customers"]:
             delta = float(pct) * (1 if kind.lower()=="increase" else -1)
             upd = {"product": prod, "customer": cust, "location": cust, "delta_pct": delta}
-            # Check for "set lead time to N"
             m_lt = re.search(r"set\s+lead\s*time\s+to\s+(\d+)", text, re.I)
             if m_lt:
                 upd["set"] = {"Lead Time": float(m_lt.group(1))}
             s["demand_updates"].append(upd)
 
     # Warehouse changes
-    # Cap Bucharest_CDC Maximum Capacity at 25000
     m_cap = re.search(r"cap\s+([A-Za-z0-9\-_]+)\s+maximum\s+capacity\s+at\s+(\d+(?:\.\d+)?)", text, re.I)
     if m_cap:
         wh, val = m_cap.groups()
@@ -79,7 +76,6 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
                 s["warehouse_changes"].append({"warehouse": wh, "field": fld, "new_value": 1})
 
     # Supplier enablement
-    # Enable Thin-Film at Antalya_FG (and Krems_FG)
     for sup in cats["suppliers"]:
         m_en = re.search(rf"enable\s+([A-Za-z0-9\-\s]+)\s+at\s+{re.escape(sup)}", text, re.I)
         if m_en:
@@ -88,7 +84,6 @@ def parse_prompt(prompt: str, dfs: Dict[str, pd.DataFrame], default_period: int 
                 s["supplier_changes"].append({"product": prod, "supplier": sup, "location": sup, "field": "Available", "new_value": 1})
 
     # Transport lane cost
-    # Set Secondary Delivery LTL lane Paris_CDC → Aalborg for Poly-Crystalline to cost per uom = 9.5
     m_tc = re.search(
         r"set\s+([A-Za-z0-9\-\s_]+)\s+lane\s+([A-Za-z0-9\-_]+)\s*(?:→|->|to)\s*([A-Za-z0-9\-\s]+)\s+for\s+([A-Za-z0-9\-\s]+)\s+to\s+cost\s+per\s+uom\s*=?\s*(\d+(?:\.\d+)?)",
         text, re.I
