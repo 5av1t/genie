@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import hashlib
 import math
+from typing import Dict, Any, List, Tuple
 import pandas as pd
 
 try:
@@ -63,6 +64,7 @@ except ModuleNotFoundError:
     missing.append("engine/geo.py (build_nodes, flows_to_geo, guess_map_center)")
     build_nodes = flows_to_geo = guess_map_center = None
 
+# GenAI is optional; we’ll still run grounded
 try:
     from engine.genai import parse_with_llm, summarize_scenario, answer_question
 except ModuleNotFoundError:
@@ -100,7 +102,7 @@ with st.sidebar:
         "- Set **Transport Cost** per lane (Mode, From, To, Product, Period)\n"
         "- **Add / Delete** customers, warehouses, lanes, demand rows\n"
         "- Run the **base model** (no edits)\n"
-        "- **Ask about results** (lowest throughput, top lanes, bottlenecks)"
+        "- **Ask about results** (lowest throughput, top lanes, bottlenecks, unserved customers)"
     )
     st.markdown("---")
     st.caption("Secrets: Streamlit Cloud → App settings → Secrets. Local: `.streamlit/secrets.toml` (add gemini/api_key or openai/api_key).")
@@ -186,6 +188,127 @@ def autoconnect_lanes(dfs, period=2023, default_cost=10.0):
         tc = pd.concat([tc, pd.DataFrame(new_rows)], ignore_index=True)
     dfs["Transport Cost"] = tc
     return dfs, len(new_rows)
+
+# ---------- Grounded QA helpers (no hallucinations) ----------
+def _served_by_customer(diag: Dict[str, Any]) -> Dict[str, float]:
+    served = {}
+    flows = (diag or {}).get("flows", [])
+    if not isinstance(flows, list):
+        return served
+    for f in flows:
+        c = str(f.get("customer"))
+        q = float(f.get("qty", 0) or 0)
+        served[c] = served.get(c, 0.0) + q
+    return served
+
+def _demand_by_customer(dfs: Dict[str, pd.DataFrame], period: int = 2023) -> Dict[str, float]:
+    cpd = dfs.get("Customer Product Data", pd.DataFrame())
+    out = {}
+    if isinstance(cpd, pd.DataFrame) and not cpd.empty:
+        df = cpd.copy()
+        if "Period" in df.columns:
+            df = df[df["Period"] == period]
+        for _, r in df.iterrows():
+            cust = str(r.get("Customer"))
+            q = float(r.get("Demand", 0) or 0)
+            out[cust] = out.get(cust, 0.0) + q
+    return out
+
+def _unserved_customers(dfs: Dict[str, pd.DataFrame], diag: Dict[str, Any], period: int = 2023) -> Tuple[int, List[Tuple[str, float]]]:
+    dem = _demand_by_customer(dfs, period)
+    srv = _served_by_customer(diag)
+    unserved_list = []
+    for c, d in dem.items():
+        s = srv.get(c, 0.0)
+        if d > 0 and s < d - 1e-9:
+            unserved_list.append((c, d - s))
+    unserved_list.sort(key=lambda x: (-x[1], x[0]))
+    return len(unserved_list), unserved_list
+
+def grounded_answer(q: str, dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
+    """Simple recognizers for common questions; return textual answer."""
+    qs = (q or "").strip().lower()
+
+    # 1) how many customers are unserved / not served
+    if any(t in qs for t in ["unserved", "not served", "not-served", "unmet"]):
+        cnt, lst = _unserved_customers(dfs, diag, period)
+        preview = ", ".join([f"{c}({int(u)})" for c, u in lst[:10]]) if lst else "—"
+        return f"{cnt} customer(s) have unmet demand. Top gaps: {preview}"
+
+    # 2) least customer demand / lowest demand customers
+    if any(t in qs for t in ["least demand", "lowest demand", "smallest demand"]):
+        dem = _demand_by_customer(dfs, period)
+        if not dem:
+            return "No demand found for the selected period."
+        # list 10 least with demand > 0
+        items = [(c, v) for c, v in dem.items() if v > 0]
+        if not items:
+            return "All customers have zero demand."
+        items.sort(key=lambda x: (x[1], x[0]))
+        top = ", ".join([f"{c}({int(v)})" for c, v in items[:10]])
+        return f"Lowest-demand customers: {top}"
+
+    # 3) service level
+    if "service" in qs and "%" in qs or "service level" in qs:
+        svc = kpis.get("service_pct")
+        total = kpis.get("total_demand")
+        served = kpis.get("served")
+        if svc is None:
+            if total and total > 0:
+                svc = round(100.0 * float(served or 0) / float(total), 2)
+            else:
+                svc = 0.0
+        return f"Service level: {svc}% (served {int(served or 0)} of {int(total or 0)})."
+
+    # 4) top flows or top lanes
+    if any(t in qs for t in ["top flows", "top lanes", "largest flows"]):
+        flows = (diag or {}).get("flows", [])
+        if not flows:
+            return "No flows available."
+        rows = sorted([(f.get("warehouse"), f.get("customer"), f.get("product"), float(f.get("qty", 0) or 0)) for f in flows],
+                      key=lambda x: -x[3])[:10]
+        txt = "; ".join([f"{w}→{c} {p}:{int(q)}" for w,c,p,q in rows])
+        return f"Top flows: {txt}"
+
+    # 5) lowest throughput warehouse (by outbound qty)
+    if any(t in qs for t in ["lowest throughput", "least throughput", "lowest outbound"]):
+        flows = (diag or {}).get("flows", [])
+        tot_by_w = {}
+        for f in flows:
+            tot_by_w[f.get("warehouse")] = tot_by_w.get(f.get("warehouse"), 0.0) + float(f.get("qty", 0) or 0)
+        if not tot_by_w:
+            return "No flows available to compute throughput."
+        rows = sorted(tot_by_w.items(), key=lambda x: (x[1], str(x[0])))[:5]
+        txt = ", ".join([f"{w}:{int(v)}" for w,v in rows])
+        return f"Lowest outbound throughput warehouses: {txt}"
+
+    return ""  # not recognized; caller can escalate to LLM
+
+def build_llm_context(dfs: Dict[str, pd.DataFrame], kpis: Dict[str, Any], diag: Dict[str, Any], period: int = 2023) -> str:
+    """Compact, bounded context for LLM to avoid hallucinations."""
+    dem = _demand_by_customer(dfs, period)
+    srv = _served_by_customer(diag)
+    # Build small tables (capped) to keep prompt short
+    least = sorted([(c, v) for c, v in dem.items()], key=lambda x: (x[1], x[0]))[:20]
+    unserved_cnt, unserved_list = _unserved_customers(dfs, diag, period)
+    unserved_top = unserved_list[:20]
+
+    def fmt_rows(rows): return "\n".join([f"- {c}: {int(v)}" for c, v in rows]) if rows else "- (none)"
+
+    lines = []
+    lines.append(f"Period: {period}")
+    lines.append(f"KPIs: status={kpis.get('status')}, total_demand={int(kpis.get('total_demand') or 0)}, served={int(kpis.get('served') or 0)}, service_pct={kpis.get('service_pct')}")
+    lines.append("Least-demand customers (up to 20):")
+    lines.append(fmt_rows(least))
+    lines.append(f"Unserved customers: count={unserved_cnt} (top up to 20):")
+    lines.append(fmt_rows(unserved_top))
+    # include products list (from Customer Product Data)
+    cpd = dfs.get("Customer Product Data", pd.DataFrame())
+    prods = []
+    if isinstance(cpd, pd.DataFrame) and "Product" in cpd.columns:
+        prods = sorted(set(cpd["Product"].dropna().astype(str).tolist()))
+    lines.append(f"Products: {', '.join(prods[:20])}" + ("" if len(prods) <= 20 else ", ..."))
+    return "\n".join(lines)
 
 # Static examples
 STATIC_EXAMPLES = [
@@ -520,11 +643,12 @@ if uploaded:
         a_tc  = newdfs.get("Transport Cost", pd.DataFrame()).copy()
         a_cu  = newdfs.get("Customers", pd.DataFrame()).copy()
 
-        # 6) Auto-connect missing lanes (optional)
+        # 6) Auto-connect missing lanes (optional; does NOT count as "user change" for delta visibility)
         auto = st.checkbox("🔗 Auto-create missing lanes for feasibility (demo)", value=True)
+        auto_created = 0
         if auto:
-            newdfs, created = autoconnect_lanes(newdfs, period=scenario.get("period", 2023), default_cost=10.0)
-            if created > 0: st.info(f"Auto-connect created {created} placeholder lane(s).")
+            newdfs, auto_created = autoconnect_lanes(newdfs, period=scenario.get("period", 2023), default_cost=10.0)
+            if auto_created > 0: st.info(f"Auto-connect created {auto_created} placeholder lane(s).")
 
         # 7) Optimize
         if run_optimizer is None: st.error("Optimizer module missing."); st.stop()
@@ -534,6 +658,7 @@ if uploaded:
         st.session_state["last_newdfs"] = newdfs
         st.session_state["last_kpis"]   = kpis
         st.session_state["last_diag"]   = diag
+        st.session_state["last_period"] = scenario.get("period", 2023)
 
         # 8) KPIs & Summary
         c1, c2 = st.columns(2)
@@ -694,7 +819,47 @@ if uploaded:
         else:
             st.info("pydeck not available or geo module missing; skipping map.")
 
-        # 11) Before/After + Δ
+        # 10.5) 💬 Ask GENIE — moved right under the solved map (uses session_state, grounded + LLM with context)
+        st.subheader("💬 Ask GENIE about results")
+        qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
+        with st.form("qa_form", clear_on_submit=False):
+            q = st.text_input("Ask things like: 'Which warehouse has the lowest throughput?' 'How many customers are unserved?' 'Lowest-demand customers?'", key="qa_text")
+            submit_qa = st.form_submit_button("Ask")
+        if submit_qa:
+            last_kpis = st.session_state.get("last_kpis", kpis)
+            last_diag = st.session_state.get("last_diag", diag)
+            last_dfs  = st.session_state.get("last_newdfs", newdfs)
+            last_period = st.session_state.get("last_period", scenario.get("period", 2023))
+
+            # Always try grounded first for recognized intents
+            ans = grounded_answer(q, last_dfs, last_kpis, last_diag, period=last_period)
+
+            # If user requested LLM or grounded didn't recognize, escalate with strict context
+            use_llm = (qa_mode.startswith("Gemini") or qa_mode.startswith("OpenAI")) and (parse_with_llm or answer_question)
+            if (not ans) and use_llm and (answer_question is not None):
+                context = build_llm_context(last_dfs, last_kpis, last_diag, period=last_period)
+                prov = "gemini" if qa_mode.startswith("Gemini") else "openai"
+                # Prefix question with bounded context to reduce hallucinations
+                q2 = f"Use ONLY this context to answer:\n{context}\n\nQuestion: {q}\nAnswer briefly and numerically when possible."
+                try:
+                    ans = answer_question(q2, last_kpis, last_diag, provider=prov, dfs=last_dfs, force_llm=True)
+                except Exception as e:
+                    ans = f"(LLM error; falling back) {grounded_answer(q, last_dfs, last_kpis, last_diag, period=last_period) or 'Sorry, I could not answer that.'}"
+
+            if not ans:
+                ans = "Sorry, I couldn't interpret that. Try asking about service %, unserved customers, lowest-demand customers, top flows, or lowest throughput warehouses."
+            st.markdown(f"**Answer**: {ans}")
+
+        # 11) Before/After + Δ (SHOW ONLY IF USER MADE CHANGES)
+        user_change_count = 0
+        for k in ["demand_updates","warehouse_changes","supplier_changes","transport_updates"]:
+            user_change_count += len(scenario.get(k, []) or [])
+        if isinstance(scenario.get("adds"), dict):
+            user_change_count += sum(len(v) for v in scenario["adds"].values())
+        if isinstance(scenario.get("deletes"), dict):
+            user_change_count += sum(len(v) for v in scenario["deletes"].values())
+        show_deltas = user_change_count > 0  # do not count autoconnect
+
         st.subheader("📋 Before vs After (Quick Preview)")
         tabs = st.tabs(["Customers","Customer Product Data","Warehouse","Supplier Product","Transport Cost"])
         with tabs[0]:
@@ -718,16 +883,19 @@ if uploaded:
             with cA: st.markdown("**Before**"); st.dataframe(b_tc.head(25), use_container_width=True)
             with cB: st.markdown("**After**");  st.dataframe(a_tc.head(25), use_container_width=True)
 
-        st.subheader("Δ Delta Views (Changes Only)")
-        show_delta("Customers", b_cu, a_cu, ["Customer","Location"])
-        show_delta("Customer Product Data", b_cpd, a_cpd, ["Product","Customer","Location","Period"])
-        if isinstance(a_wh, pd.DataFrame) and not a_wh.empty:
-            wh_keys = ["Warehouse"] + (["Period"] if "Period" in a_wh.columns and "Period" in b_wh.columns else [])
-            show_delta("Warehouse", b_wh, a_wh, wh_keys)
-        if isinstance(a_sp, pd.DataFrame) and not a_sp.empty:
-            show_delta("Supplier Product", b_sp, a_sp, ["Product","Supplier","Location","Period"])
-        if isinstance(a_tc, pd.DataFrame) and not a_tc.empty:
-            show_delta("Transport Cost", b_tc, a_tc, ["Mode of Transport","Product","From Location","To Location","Period"])
+        if show_deltas:
+            st.subheader("Δ Delta Views (Changes Only)")
+            show_delta("Customers", b_cu, a_cu, ["Customer","Location"])
+            show_delta("Customer Product Data", b_cpd, a_cpd, ["Product","Customer","Location","Period"])
+            if isinstance(a_wh, pd.DataFrame) and not a_wh.empty:
+                wh_keys = ["Warehouse"] + (["Period"] if "Period" in a_wh.columns and "Period" in b_wh.columns else [])
+                show_delta("Warehouse", b_wh, a_wh, wh_keys)
+            if isinstance(a_sp, pd.DataFrame) and not a_sp.empty:
+                show_delta("Supplier Product", b_sp, a_sp, ["Product","Supplier","Location","Period"])
+            if isinstance(a_tc, pd.DataFrame) and not a_tc.empty:
+                show_delta("Transport Cost", b_tc, a_tc, ["Mode of Transport","Product","From Location","To Location","Period"])
+        else:
+            st.info("No user edits detected (base model). Skipping delta tables.")
 
         # 12) Export
         st.subheader("💾 Export")
@@ -736,7 +904,6 @@ if uploaded:
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
                 for name, df in newdfs.items():
                     if isinstance(df, pd.DataFrame):
-                        # Excel sheet names are max 31 chars
                         sname = str(name)[:31] or "Sheet"
                         df.to_excel(w, sheet_name=sname, index=False)
             st.download_button(
@@ -747,27 +914,6 @@ if uploaded:
             )
         except Exception as e:
             st.warning(f"Creating the Excel download failed: {e}")
-
-    # ---------------- Ask GENIE (persists across reruns) ----------------
-    st.subheader("💬 Ask GENIE about results")
-    qa_mode = st.radio("Answer mode", ["Grounded (no LLM)","Gemini (LLM)","OpenAI (LLM)"], index=0, horizontal=True, key="qa_mode")
-    with st.form("qa_form", clear_on_submit=False):
-        q = st.text_input("e.g., 'Which warehouse has the lowest throughput?' 'Top 3 lanes by flow?'", key="qa_text")
-        submit_qa = st.form_submit_button("Ask")
-    if submit_qa:
-        last_kpis = st.session_state.get("last_kpis")
-        last_diag = st.session_state.get("last_diag")
-        last_dfs  = st.session_state.get("last_newdfs")
-        if not last_kpis or not last_diag:
-            st.error("No results in memory yet. Run a scenario first.")
-        else:
-            prov = "gemini" if qa_mode.startswith("Gemini") else ("openai" if qa_mode.startswith("OpenAI") else "gemini")
-            force_llm = not qa_mode.startswith("Grounded")
-            if answer_question is None:
-                st.error("GenAI Q&A not available.")
-            else:
-                ans = answer_question(q.strip(), last_kpis, last_diag, provider=prov, dfs=last_dfs, force_llm=force_llm)
-                st.markdown(f"**Answer**: {ans}")
 
 else:
     st.info("Upload your base case to begin. Or download a sample template:")
