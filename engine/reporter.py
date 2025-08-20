@@ -25,6 +25,30 @@ def build_summary(prompt: str, scenario: Dict[str, Any], kpis: Dict[str, Any], d
     for t in scenario.get("transport_updates", []):
         changes.append(f"Transport: {t.get('mode')} {t.get('from_location')}→{t.get('to_location')} ({t.get('product')}) {t.get('fields')}")
 
+    adds = scenario.get("adds", {})
+    for c in adds.get("customers", []):
+        changes.append(f"Add customer {c.get('customer')} at {c.get('location')}")
+    for d in adds.get("customer_demands", []):
+        changes.append(f"Add demand {d.get('demand')} of {d.get('product')} at {d.get('customer')} (period {d.get('period')})")
+    for w in adds.get("warehouses", []):
+        changes.append(f"Add warehouse {w.get('warehouse')} at {w.get('location')} {w.get('fields')}")
+    for sp in adds.get("supplier_products", []):
+        changes.append(f"Add supplier product {sp.get('product')} at {sp.get('supplier')} (Available={sp.get('fields',{}).get('Available')})")
+    for tl in adds.get("transport_lanes", []):
+        changes.append(f"Add lane {tl.get('mode')} {tl.get('from_location')}→{tl.get('to_location')} ({tl.get('product')})")
+
+    dels = scenario.get("deletes", {})
+    for c in dels.get("customers", []):
+        changes.append(f"Delete customer {c.get('customer')}")
+    for d in dels.get("customer_product_rows", []):
+        changes.append(f"Delete demand row {d.get('product')} at {d.get('customer')} (period {d.get('period')})")
+    for w in dels.get("warehouses", []):
+        changes.append(f"Delete warehouse {w.get('warehouse')}")
+    for sp in dels.get("supplier_products", []):
+        changes.append(f"Delete supplier product {sp.get('product')} at {sp.get('supplier')}")
+    for tl in dels.get("transport_lanes", []):
+        changes.append(f"Delete lane {tl.get('mode')} {tl.get('from_location')}→{tl.get('to_location')} ({tl.get('product')})")
+
     bullet_changes = _bulletize(changes)
 
     lines = [
